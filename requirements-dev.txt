@@ -1,0 +1,5 @@
+# Development and testing dependencies
+pytest>=8.3
+pytest-cov>=5.0
+ruff>=0.6
+responses>=0.25

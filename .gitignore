@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+
+# Editors
+.vscode/
+.idea/
+
+# Testing artifacts
+.coverage
+htmlcov/
+
+# Misc
+*.log
