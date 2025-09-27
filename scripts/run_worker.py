@@ -32,6 +32,19 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
 def main(argv: List[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO)
+
+    # Start metrics server if available
+    try:
+        from src.core.metrics import start_metrics_server
+        import os
+        metrics_port = int(os.getenv("METRICS_PORT", "9300"))
+        start_metrics_server(metrics_port)
+        logger.info(f"Metrics server started on port {metrics_port}")
+    except ImportError:
+        logger.info("Metrics disabled - prometheus_client not installed")
+    except Exception as e:
+        logger.warning(f"Metrics server already running or failed to start: {e}")
+
     queue = load_default_queue()
     logger.info("worker_queue_selected", extra={"queue_class": queue.__class__.__name__})
     worker = Worker(queue=queue)

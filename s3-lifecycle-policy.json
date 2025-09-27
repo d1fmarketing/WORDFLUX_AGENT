@@ -1,0 +1,43 @@
+{
+    "Rules": [
+        {
+            "ID": "Delete-old-artifacts",
+            "Status": "Enabled",
+            "Filter": {
+                "Prefix": "artifacts/"
+            },
+            "Expiration": {
+                "Days": 7
+            },
+            "NoncurrentVersionExpiration": {
+                "NoncurrentDays": 1
+            }
+        },
+        {
+            "ID": "Delete-csv-exports-after-30days",
+            "Status": "Enabled",
+            "Filter": {
+                "Prefix": "exports/"
+            },
+            "Expiration": {
+                "Days": 30
+            }
+        },
+        {
+            "ID": "Transition-old-logs-to-glacier",
+            "Status": "Enabled",
+            "Filter": {
+                "Prefix": "logs/"
+            },
+            "Transitions": [
+                {
+                    "Days": 30,
+                    "StorageClass": "GLACIER"
+                }
+            ],
+            "Expiration": {
+                "Days": 365
+            }
+        }
+    ]
+}

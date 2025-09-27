@@ -1,0 +1,28 @@
+[Unit]
+Description=WordFlux API
+After=network-online.target redis-server.service
+Wants=network-online.target
+Requires=redis-server.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+Environment="PYTHONPATH=/home/ubuntu:/home/ubuntu/src"
+Environment="QUEUE_MODE=redis"
+Environment="REDIS_URL=redis://localhost:6379/0"
+Environment="API_PORT=8000"
+Environment="API_HOST=0.0.0.0"
+Environment="METRICS_PORT=9300"
+EnvironmentFile=-/home/ubuntu/.env
+ExecStart=/home/ubuntu/.venv/bin/python -m src.api.main
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wordflux-api
+
+[Install]
+WantedBy=multi-user.target

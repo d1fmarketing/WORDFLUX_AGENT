@@ -12,6 +12,20 @@ from src.core.registry import create_agent
 
 logger = logging.getLogger(__name__)
 
+# Optional metrics support
+try:
+    from src.core.metrics import (
+        record_job_processed,
+        record_worker_error,
+        start_metrics_server,
+        update_queue_metrics,
+        get_redis_queue_metrics
+    )
+    METRICS_ENABLED = True
+except ImportError:
+    METRICS_ENABLED = False
+    logger.info("Metrics disabled - prometheus_client not installed")
+
 ResultHandler = Callable[[Job, dict], None]
 ErrorHandler = Callable[[Job, Exception], None]
 
@@ -30,19 +44,37 @@ class Worker:
         self.error_handler = error_handler
 
     def run_once(self, timeout: float | None = 1.0) -> bool:
-        job = self.queue.consume(timeout=timeout)
-        if job is None:
+        # Update queue metrics if enabled
+        if METRICS_ENABLED:
+            metrics = get_redis_queue_metrics()
+            update_queue_metrics(metrics['queue_size'], metrics['processing_size'])
+
+        dequeued = self.queue.consume(timeout=timeout)
+        if dequeued is None:
             return False
+        job = dequeued.job
+        start_time = time.time()
+        success = False
         try:
             agent = create_agent(job.agent)
             result = agent.run(job.payload)
             if self.result_handler is not None:
                 self.result_handler(job, result)
+            # Acknowledge job after successful processing
+            dequeued.ack()
+            success = True
         except Exception as exc:  # noqa: BLE001 - propagate to handler
             logger.exception("worker_error", extra={"job_id": job.job_id, "agent": job.agent})
             if self.error_handler is not None:
                 self.error_handler(job, exc)
+            if METRICS_ENABLED:
+                record_worker_error(job.agent)
+            # Always ack to remove from processing list, even on error
+            dequeued.ack()
         finally:
+            duration = time.time() - start_time
+            if METRICS_ENABLED:
+                record_job_processed(job.agent, success, duration)
             self.queue.task_done()
         return True
 

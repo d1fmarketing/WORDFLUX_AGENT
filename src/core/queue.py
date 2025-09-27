@@ -15,6 +15,22 @@ from src.core.job import Job
 
 logger = logging.getLogger(__name__)
 
+
+class DequeuedJob:
+    """Wrapper for a dequeued job with acknowledgment capability."""
+
+    def __init__(self, job: Job, queue: 'JobQueue', processing_key: str | None = None):
+        self.job = job
+        self._queue = queue
+        self._processing_key = processing_key
+        self._acked = False
+
+    def ack(self) -> None:
+        """Acknowledge that the job has been processed."""
+        if not self._acked:
+            self._queue.ack_job(self)
+            self._acked = True
+
 try:  # pragma: no cover - optional dependency
     import redis
 except ModuleNotFoundError:  # pragma: no cover - handled at runtime
@@ -33,6 +49,12 @@ class RedisLike(Protocol):
     def blpop(self, key: str, timeout: int | None = ...) -> tuple[str, str] | None:
         ...
 
+    def brpoplpush(self, source: str, dest: str, timeout: int | None = ...) -> str | None:
+        ...
+
+    def lrem(self, key: str, count: int, value: str) -> int:
+        ...
+
 
 class JobQueue(ABC):
     """Abstract job queue."""
@@ -42,12 +64,16 @@ class JobQueue(ABC):
         """Push a job onto the queue."""
 
     @abstractmethod
-    def consume(self, timeout: float | None = None) -> Optional[Job]:
+    def consume(self, timeout: float | None = None) -> Optional[DequeuedJob]:
         """Pop a job, blocking up to timeout seconds."""
 
     @abstractmethod
     def task_done(self) -> None:
         """Signal that a consumed job has been handled."""
+
+    def ack_job(self, dequeued: DequeuedJob) -> None:
+        """Acknowledge a specific job (for claim/ack pattern)."""
+        pass
 
 
 class MemoryJobQueue(JobQueue):
@@ -59,9 +85,10 @@ class MemoryJobQueue(JobQueue):
     def publish(self, job: Job) -> None:
         self._queue.put(job)
 
-    def consume(self, timeout: float | None = None) -> Optional[Job]:
+    def consume(self, timeout: float | None = None) -> Optional[DequeuedJob]:
         try:
-            return self._queue.get(timeout=timeout)
+            job = self._queue.get(timeout=timeout)
+            return DequeuedJob(job, self) if job else None
         except queue.Empty:
             return None
 
@@ -77,37 +104,44 @@ class RedisJobQueue(JobQueue):
             raise RuntimeError("redis package is not installed")
         self._client = client
         self._key = key
+        self._processing_key = f"{key}:processing"
 
     def publish(self, job: Job) -> None:
         payload = json.dumps(job.as_dict())
         self._client.rpush(self._key, payload)
 
-    def consume(self, timeout: float | None = None) -> Optional[Job]:
+    def consume(self, timeout: float | None = None) -> Optional[DequeuedJob]:
+        # Use BRPOPLPUSH for claim/ack pattern
         if timeout is None:
-            result = self._client.blpop(self._key)
+            payload = self._client.brpoplpush(self._key, self._processing_key)
         elif timeout <= 0:
-            result = self._client.lpop(self._key)
-            if result is None:
-                return None
-            payload = result
-            return self._decode_job(payload)
+            # Non-blocking pop with claim
+            payload = self._client.lrem(self._processing_key, 1, "dummy")  # Try processing list first
+            if not payload:
+                payload = self._client.brpoplpush(self._key, self._processing_key, timeout=0)
         else:
             block_timeout = max(1, int(math.ceil(timeout)))
-            result = self._client.blpop(self._key, timeout=block_timeout)
+            payload = self._client.brpoplpush(self._key, self._processing_key, timeout=block_timeout)
 
-        if result is None:
+        if payload is None:
             return None
 
-        if isinstance(result, tuple):
-            _, payload = result
-        else:
-            payload = result
+        job = self._decode_job(payload)
+        if job is None:
+            # Remove invalid job from processing list
+            self._client.lrem(self._processing_key, 1, payload)
+            return None
 
-        return self._decode_job(payload)
+        return DequeuedJob(job, self, payload)
 
     def task_done(self) -> None:
-        # Redis streams/lists acknowledge via pop, so nothing further is required.
+        # Redis streams/lists acknowledge via ack_job, so nothing further is required.
         return None
+
+    def ack_job(self, dequeued: DequeuedJob) -> None:
+        """Remove job from processing list after successful completion."""
+        if dequeued._processing_key:
+            self._client.lrem(self._processing_key, 1, dequeued._processing_key)
 
     def _decode_job(self, payload: str) -> Job | None:
         try:
@@ -181,6 +215,7 @@ def set_default_queue(queue_impl: JobQueue) -> None:
 
 __all__ = [
     "JobQueue",
+    "DequeuedJob",
     "MemoryJobQueue",
     "RedisJobQueue",
     "load_default_queue",
