@@ -286,7 +286,11 @@ v0.5-s3-encryption
 
 ### ⚠️ Requires Valid Credentials:
 1. **AWS S3**: Lifecycle and encryption configured but needs real AWS keys
+   - Add to .env: `AWS_ACCESS_KEY_ID=your-real-key`
+   - Add to .env: `AWS_SECRET_ACCESS_KEY=your-real-secret`
+   - Or configure with: `aws configure`
 2. **Slack**: Webhook URL configured but needs real webhook
+   - Update in .env: `SLACK_WEBHOOK_URL=your-real-webhook-url`
 
 ### Critical Issues Resolved:
 - ✅ Idempotency now returns duplicate flag
