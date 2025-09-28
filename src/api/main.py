@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import uvicorn
@@ -100,7 +100,8 @@ async def save_idempotency(key: str, response: Dict[str, Any]) -> None:
         return
 
     try:
-        client.setex(key, IDEMPOTENCY_TTL, json.dumps(response))
+        # Use SET NX for atomic operation
+        client.set(key, json.dumps(response), nx=True, ex=IDEMPOTENCY_TTL)
     except Exception as e:
         logger.warning(f"Failed to save idempotency key: {e}")
 
@@ -164,7 +165,7 @@ async def health_check():
 
     return HealthResponse(
         status="healthy",
-        timestamp=datetime.utcnow().isoformat(),
+        timestamp=datetime.now(timezone.utc).isoformat(),
         redis=redis_status,
         queue_mode=os.getenv("QUEUE_MODE", "memory")
     )
@@ -177,7 +178,7 @@ async def handle_event(request: EventRequest, app_request: Request):
 
     Events are converted to jobs and enqueued for processing.
     """
-    start_time = datetime.utcnow()
+    start_time = datetime.now(timezone.utc)
 
     # Check idempotency
     idempotency_key = generate_idempotency_key(request)
@@ -189,7 +190,7 @@ async def handle_event(request: EventRequest, app_request: Request):
         if hasattr(app_request.app.state, 'metrics_enabled') and app_request.app.state.metrics_enabled:
             from src.core.metrics import record_idempotency_hit, record_api_request
             record_idempotency_hit()
-            duration = (datetime.utcnow() - start_time).total_seconds()
+            duration = (datetime.now(timezone.utc) - start_time).total_seconds()
             record_api_request("/event", "POST", 200, duration)
         # Add duplicate flag to cached response
         cached_response["duplicate"] = True
@@ -239,7 +240,7 @@ async def handle_event(request: EventRequest, app_request: Request):
         if hasattr(app_request.app.state, 'metrics_enabled') and app_request.app.state.metrics_enabled:
             from src.core.metrics import record_job_enqueued, record_api_request
             record_job_enqueued(agent)
-            duration = (datetime.utcnow() - start_time).total_seconds()
+            duration = (datetime.now(timezone.utc) - start_time).total_seconds()
             record_api_request("/event", "POST", 200, duration)
 
         return EventResponse(**response)
