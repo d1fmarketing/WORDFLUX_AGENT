@@ -6,6 +6,9 @@ import fakeredis
 from src.core.job import build_job
 from src.core.queue import MemoryJobQueue, RedisJobQueue, load_default_queue
 
+# fakeredis brpoplpush hangs at timeout=0, tiny >0 returns immediately
+NONBLOCK = 0.05
+
 
 def test_memory_queue_publish_and_consume() -> None:
     queue = MemoryJobQueue()
@@ -26,7 +29,7 @@ def test_redis_queue_publish_and_consume_via_lpop() -> None:
     job = build_job(agent="echo", payload={"message": "hello"})
 
     queue.publish(job)
-    retrieved = queue.consume(timeout=0.01)
+    retrieved = queue.consume(timeout=NONBLOCK)
 
     assert retrieved is not None
     assert retrieved.job.agent == job.agent
@@ -55,7 +58,7 @@ def test_redis_queue_consume_empty_returns_none() -> None:
     queue = RedisJobQueue(client=client, key="test-queue")
 
     # Use a small timeout instead of 0 to avoid blocking
-    assert queue.consume(timeout=0.01) is None
+    assert queue.consume(timeout=NONBLOCK) is None
 
 
 def test_redis_queue_invalid_payload_returns_none() -> None:
@@ -65,7 +68,7 @@ def test_redis_queue_invalid_payload_returns_none() -> None:
     # Manually push invalid JSON to the queue
     client.rpush("test-queue", "not-json")
 
-    assert queue.consume(timeout=0.01) is None
+    assert queue.consume(timeout=NONBLOCK) is None
 
 
 def test_load_default_queue_uses_redis(monkeypatch) -> None:
