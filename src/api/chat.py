@@ -1,6 +1,7 @@
 """Chat API router with LLM integration and approval workflow."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -11,10 +12,17 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Request
-from pydantic import BaseModel, Field, ValidationError, validator
+from pydantic import BaseModel, Field, ValidationError, validator, model_validator
 from typing import Literal
 
 from src.core.events import emit_chat_message
+
+# Import optimistic update metrics
+from src.core.metrics_optimistic import (
+    record_optimistic_job_queued,
+    record_pipeline_execution,
+    record_clock_skew_fallback,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -466,8 +474,28 @@ def estimate_token_count(text: str) -> int:
 # Pydantic models
 class ChatRequest(BaseModel):
     """Request model for chat endpoint."""
-    message: str = Field(..., max_length=2000, description="User message (max 2000 chars)")
+    text: Optional[str] = Field(None, max_length=2000, description="User message (max 2000 chars)")
+    message: Optional[str] = Field(None, max_length=2000, description="User message (legacy field, use 'text' instead)")
     session_id: str = Field(default_factory=lambda: f"sess-{uuid.uuid4().hex[:8]}", description="Session ID for conversation")
+
+    @model_validator(mode='after')
+    def normalize_and_validate_text(self):
+        """Normalize 'message' to 'text' field for backward compatibility."""
+        # If text is provided and not empty, use it
+        if self.text is not None and self.text.strip():
+            return self
+
+        # Otherwise, use message field (backward compatibility)
+        if self.message is not None and self.message.strip():
+            self.text = self.message
+            return self
+
+        # Neither provided or both empty - raise error
+        raise ValueError("Campo 'text' é obrigatório")
+
+    class Config:
+        # Allow both fields to coexist
+        extra = 'ignore'
 
 
 class ChatResponse(BaseModel):
@@ -1112,6 +1140,101 @@ def delete_pending_confirmation(session_id: str) -> None:
         logger.error(f"Failed to delete pending confirmation: {e}")
 
 
+def generate_deterministic_job_id(session_id: str, tool_name: str, tool_args: Dict[str, Any]) -> str:
+    """
+    Generate deterministic job ID using SHA1 hash.
+
+    Creates a reproducible job_id from session + tool_name + sorted args.
+    This enables idempotency: same request = same job_id = deduplication.
+
+    Args:
+        session_id: User session identifier
+        tool_name: Tool/action name (e.g., "create_card")
+        tool_args: Tool arguments dict
+
+    Returns:
+        Deterministic job_id string (format: "job-{sha1[:12]}")
+
+    Examples:
+        >>> generate_deterministic_job_id("sess-123", "create_card", {"title": "Test"})
+        "job-a1b2c3d4e5f6"
+
+        >>> # Same inputs = same output (idempotent)
+        >>> id1 = generate_deterministic_job_id("s1", "move_card", {"to": "Done"})
+        >>> id2 = generate_deterministic_job_id("s1", "move_card", {"to": "Done"})
+        >>> assert id1 == id2
+    """
+    # Stable JSON serialization (sorted keys, no whitespace, UTF-8)
+    stable_args = json.dumps(tool_args, sort_keys=True, ensure_ascii=False)
+
+    # Combine components
+    payload = f"{session_id}:{tool_name}:{stable_args}"
+
+    # SHA1 hash (sufficient for job IDs, faster than SHA256)
+    hash_digest = hashlib.sha1(payload.encode('utf-8')).hexdigest()
+
+    # Return job-{first 12 hex chars} for readability
+    return f"job-{hash_digest[:12]}"
+
+
+def _publish_job_atomic(queue, job: 'Job', events_to_emit: list) -> None:
+    """
+    Atomically publish job and emit SSE events using Redis pipeline.
+
+    This prevents the scenario where a job is enqueued but events are lost
+    due to Redis failure between queue.publish() and emit_*() calls.
+
+    Args:
+        queue: JobQueue instance
+        job: Job to enqueue
+        events_to_emit: List of (emit_func, kwargs) tuples to call with pipe parameter
+
+    Raises:
+        Exception: If Redis pipeline execution fails
+    """
+    from src.core.queue import RedisJobQueue
+
+    if isinstance(queue, RedisJobQueue):
+        # Use Redis pipeline for atomicity
+        redis_client = queue._client
+        pipe = redis_client.pipeline()
+
+        # Add job to queue (via pipeline)
+        job_json = json.dumps(job.as_dict())
+        pipe.rpush(queue._key, job_json)
+
+        # Emit SSE events (via pipeline)
+        for emit_func, kwargs in events_to_emit:
+            emit_func(**kwargs, pipe=pipe)
+
+        # Calculate pipeline size: 1 queue push + (3 commands per SSE event: publish + lpush + ltrim)
+        pipeline_size = 1 + (len(events_to_emit) * 3)
+
+        # Execute atomically: all or nothing
+        try:
+            pipe.execute()
+
+            # Record successful pipeline execution
+            record_pipeline_execution(
+                operation_type="queue_publish_with_sse",
+                status="success",
+                pipeline_size=pipeline_size
+            )
+        except Exception as e:
+            # Record failed pipeline execution
+            record_pipeline_execution(
+                operation_type="queue_publish_with_sse",
+                status="error",
+                pipeline_size=pipeline_size
+            )
+            raise  # Re-raise to preserve original behavior
+    else:
+        # Fallback for MemoryJobQueue (no atomicity needed)
+        queue.publish(job)
+        for emit_func, kwargs in events_to_emit:
+            emit_func(**kwargs)
+
+
 def execute_tool_call(tool_call: Dict[str, Any], session_id: str) -> Optional[str]:
     """
     Execute a confirmed tool call.
@@ -1137,6 +1260,21 @@ def execute_tool_call(tool_call: Dict[str, Any], session_id: str) -> Optional[st
 
         # Implementation based on tool type
         if func_name == "create_card":
+            # Generate deterministic job_id for idempotency
+            job_id = generate_deterministic_job_id(session_id, func_name, func_args)
+
+            # Get Redis timestamp to avoid clock skew (single source of truth)
+            from src.core.queue import RedisJobQueue
+            queued_at = time.time()  # Fallback to local time
+            if isinstance(queue, RedisJobQueue):
+                try:
+                    redis_time = queue._client.time()  # Returns (seconds, microseconds)
+                    queued_at = redis_time[0] + redis_time[1] / 1e6
+                except Exception as e:
+                    # P0 fix: Log clock skew fallback and record metric
+                    logger.warning(f"Redis TIME() failed for create_card, using local time (clock skew possible): {e}")
+                    record_clock_skew_fallback(location='create_card_execute')
+
             # Criar novo card via board_operator
             job = Job(
                 agent="board_operator",
@@ -1150,13 +1288,54 @@ def execute_tool_call(tool_call: Dict[str, Any], session_id: str) -> Optional[st
                     "from_chat": True,
                     "session_id": session_id
                 },
-                job_id=f"chat-{uuid.uuid4().hex[:8]}"
+                job_id=job_id,
+                metadata={
+                    "queued_at": queued_at,
+                    "session_id": session_id,
+                    "action": "create_card"
+                }
             )
-            queue.publish(job)
-            job_id = job.job_id
-            logger.info(f"📋 Enfileirado create_card: título='{func_args.get('title', '')}' → job={job_id}")
+
+            # Record optimistic job queued metric
+            record_optimistic_job_queued(
+                action="create_card",
+                session_id_present=(session_id is not None)
+            )
+
+            # ATOMIC: Enqueue job + emit SSE events in single Redis pipeline
+            from src.core.events import emit_job_queued, emit_card_pending
+            _publish_job_atomic(queue, job, [
+                (emit_job_queued, {"job_id": job_id, "action": "create_card", "args": func_args, "session_id": session_id}),
+                (emit_card_pending, {
+                    "temp_id": job_id,
+                    "title": func_args.get("title", ""),
+                    "list_name": func_args.get("column", "Espera"),
+                    "meta": {
+                        "assignees": func_args.get("assignees", []),
+                        "tags": func_args.get("tags", []),
+                        "due_date": func_args.get("due_date")
+                    },
+                    "session_id": session_id
+                })
+            ])
+            logger.info(f"📋 Enfileirado create_card (atomic): título='{func_args.get('title', '')}' → job={job_id}")
 
         elif func_name == "move_card":
+            # Generate deterministic job_id for idempotency
+            job_id = generate_deterministic_job_id(session_id, func_name, func_args)
+
+            # Get Redis timestamp to avoid clock skew (single source of truth)
+            from src.core.queue import RedisJobQueue
+            queued_at = time.time()  # Fallback to local time
+            if isinstance(queue, RedisJobQueue):
+                try:
+                    redis_time = queue._client.time()  # Returns (seconds, microseconds)
+                    queued_at = redis_time[0] + redis_time[1] / 1e6
+                except Exception as e:
+                    # P0 fix: Log clock skew fallback and record metric
+                    logger.warning(f"Redis TIME() failed for move_card, using local time (clock skew possible): {e}")
+                    record_clock_skew_fallback(location='move_card_execute')
+
             # Mover card via board_operator
             job = Job(
                 agent="board_operator",
@@ -1167,13 +1346,50 @@ def execute_tool_call(tool_call: Dict[str, Any], session_id: str) -> Optional[st
                     "from_chat": True,
                     "session_id": session_id
                 },
-                job_id=f"chat-{uuid.uuid4().hex[:8]}"
+                job_id=job_id,
+                metadata={
+                    "queued_at": queued_at,
+                    "session_id": session_id,
+                    "action": "move_card"
+                }
             )
-            queue.publish(job)
-            job_id = job.job_id
-            logger.info(f"📋 Enfileirado move_card: {func_args.get('card_id', '')} → {func_args.get('to_column', '')} (job={job_id})")
+
+            # Record optimistic job queued metric
+            record_optimistic_job_queued(
+                action="move_card",
+                session_id_present=(session_id is not None)
+            )
+
+            # ATOMIC: Enqueue job + emit SSE events in single Redis pipeline
+            from src.core.events import emit_job_queued, emit_card_pending
+            _publish_job_atomic(queue, job, [
+                (emit_job_queued, {"job_id": job_id, "action": "move_card", "args": func_args, "session_id": session_id}),
+                (emit_card_pending, {
+                    "temp_id": job_id,
+                    "title": f"Moving {func_args.get('card_id', '')}...",
+                    "list_name": func_args.get("to_column", ""),
+                    "meta": {"original_card_id": func_args.get("card_id", "")},
+                    "session_id": session_id
+                })
+            ])
+            logger.info(f"📋 Enfileirado move_card (atomic): {func_args.get('card_id', '')} → {func_args.get('to_column', '')} (job={job_id})")
 
         elif func_name == "update_card":
+            # Generate deterministic job_id for idempotency
+            job_id = generate_deterministic_job_id(session_id, func_name, func_args)
+
+            # Get Redis timestamp to avoid clock skew (single source of truth)
+            from src.core.queue import RedisJobQueue
+            queued_at = time.time()  # Fallback to local time
+            if isinstance(queue, RedisJobQueue):
+                try:
+                    redis_time = queue._client.time()  # Returns (seconds, microseconds)
+                    queued_at = redis_time[0] + redis_time[1] / 1e6
+                except Exception as e:
+                    # P0 fix: Log clock skew fallback and record metric
+                    logger.warning(f"Redis TIME() failed for update_card, using local time (clock skew possible): {e}")
+                    record_clock_skew_fallback(location='update_card_execute')
+
             # Atualizar card via board_operator
             job = Job(
                 agent="board_operator",
@@ -1184,11 +1400,28 @@ def execute_tool_call(tool_call: Dict[str, Any], session_id: str) -> Optional[st
                     "from_chat": True,
                     "session_id": session_id
                 },
-                job_id=f"chat-{uuid.uuid4().hex[:8]}"
+                job_id=job_id,
+                metadata={
+                    "queued_at": queued_at,
+                    "session_id": session_id,
+                    "action": "update_card"
+                }
             )
-            queue.publish(job)
-            job_id = job.job_id
-            logger.info(f"📋 Enfileirado update_card: {func_args.get('card_id', '')} (job={job_id})")
+
+            # Record optimistic job queued metric
+            record_optimistic_job_queued(
+                action="update_card",
+                session_id_present=(session_id is not None)
+            )
+
+            # ATOMIC: Enqueue job + emit SSE events in single Redis pipeline
+            from src.core.events import emit_job_queued
+            _publish_job_atomic(queue, job, [
+                (emit_job_queued, {"job_id": job_id, "action": "update_card", "args": func_args, "session_id": session_id})
+            ])
+            # Note: update_card doesn't need card.pending since it's an in-place update
+            # Frontend will wait for card.updated event
+            logger.info(f"📋 Enfileirado update_card (atomic): {func_args.get('card_id', '')} (job={job_id})")
 
         elif func_name == "summarize_board":
             # Resumo do board (não enfileira job, responde inline)
@@ -1210,14 +1443,9 @@ def execute_tool_call(tool_call: Dict[str, Any], session_id: str) -> Optional[st
             "params": func_args
         })
 
-        # Emit job_queued event if job was created
-        if job_id:
-            emit_sse_event("job_queued", {
-                "job_id": job_id,
-                "agent": func_args.get("agent") or func_name,
-                "from_chat": True,
-                "session_id": session_id
-            })
+        # Note: job_queued and card.pending events are now emitted
+        # immediately after queue.publish() for each tool type above
+        # (optimistic updates for UI)
 
     except Exception as e:
         logger.error(f"Failed to execute tool call {func_name}: {e}")
@@ -1261,6 +1489,18 @@ def execute_tool_call_with_id(
 
         # Implementation based on tool type
         if func_name == "create_card":
+            # Get Redis timestamp to avoid clock skew (single source of truth)
+            from src.core.queue import RedisJobQueue
+            queued_at = time.time()  # Fallback to local time
+            if isinstance(queue, RedisJobQueue):
+                try:
+                    redis_time = queue._client.time()  # Returns (seconds, microseconds)
+                    queued_at = redis_time[0] + redis_time[1] / 1e6
+                except Exception as e:
+                    # P0 fix: Log clock skew fallback and record metric
+                    logger.warning(f"Redis TIME() failed for create_card (with_id), using local time (clock skew possible): {e}")
+                    record_clock_skew_fallback(location='create_card_with_id')
+
             # Criar novo card via board_operator
             job = Job(
                 agent="board_operator",
@@ -1274,12 +1514,51 @@ def execute_tool_call_with_id(
                     "from_chat": True,
                     "session_id": session_id
                 },
-                job_id=job_id  # Use pre-generated ID
+                job_id=job_id,  # Use pre-generated ID
+                metadata={
+                    "queued_at": queued_at,
+                    "session_id": session_id,
+                    "action": "create_card"
+                }
             )
-            queue.publish(job)
-            logger.info(f"📋 Enfileirado create_card (idempotente): título='{func_args.get('title', '')}' → job={job_id}")
+
+            # Record optimistic job queued metric
+            record_optimistic_job_queued(
+                action="create_card",
+                session_id_present=(session_id is not None)
+            )
+
+            # ATOMIC: Enqueue job + emit SSE events in single Redis pipeline
+            from src.core.events import emit_job_queued, emit_card_pending
+            _publish_job_atomic(queue, job, [
+                (emit_job_queued, {"job_id": job_id, "action": "create_card", "args": func_args, "session_id": session_id}),
+                (emit_card_pending, {
+                    "temp_id": job_id,
+                    "title": func_args.get("title", ""),
+                    "list_name": func_args.get("column", "Espera"),
+                    "meta": {
+                        "assignees": func_args.get("assignees", []),
+                        "tags": func_args.get("tags", []),
+                        "due_date": func_args.get("due_date")
+                    },
+                    "session_id": session_id
+                })
+            ])
+            logger.info(f"📋 Enfileirado create_card (idempotente+atomic): título='{func_args.get('title', '')}' → job={job_id}")
 
         elif func_name == "move_card":
+            # Get Redis timestamp to avoid clock skew (single source of truth)
+            from src.core.queue import RedisJobQueue
+            queued_at = time.time()  # Fallback to local time
+            if isinstance(queue, RedisJobQueue):
+                try:
+                    redis_time = queue._client.time()  # Returns (seconds, microseconds)
+                    queued_at = redis_time[0] + redis_time[1] / 1e6
+                except Exception as e:
+                    # P0 fix: Log clock skew fallback and record metric
+                    logger.warning(f"Redis TIME() failed for move_card (with_id), using local time (clock skew possible): {e}")
+                    record_clock_skew_fallback(location='move_card_with_id')
+
             # Mover card via board_operator
             job = Job(
                 agent="board_operator",
@@ -1290,12 +1569,47 @@ def execute_tool_call_with_id(
                     "from_chat": True,
                     "session_id": session_id
                 },
-                job_id=job_id  # Use pre-generated ID
+                job_id=job_id,  # Use pre-generated ID
+                metadata={
+                    "queued_at": queued_at,
+                    "session_id": session_id,
+                    "action": "move_card"
+                }
             )
-            queue.publish(job)
-            logger.info(f"📋 Enfileirado move_card (idempotente): {func_args.get('card_id', '')} → {func_args.get('to_column', '')} (job={job_id})")
+
+            # Record optimistic job queued metric
+            record_optimistic_job_queued(
+                action="move_card",
+                session_id_present=(session_id is not None)
+            )
+
+            # ATOMIC: Enqueue job + emit SSE events in single Redis pipeline
+            from src.core.events import emit_job_queued, emit_card_pending
+            _publish_job_atomic(queue, job, [
+                (emit_job_queued, {"job_id": job_id, "action": "move_card", "args": func_args, "session_id": session_id}),
+                (emit_card_pending, {
+                    "temp_id": job_id,
+                    "title": f"Moving {func_args.get('card_id', '')}...",
+                    "list_name": func_args.get("to_column", ""),
+                    "meta": {"original_card_id": func_args.get("card_id", "")},
+                    "session_id": session_id
+                })
+            ])
+            logger.info(f"📋 Enfileirado move_card (idempotente+atomic): {func_args.get('card_id', '')} → {func_args.get('to_column', '')} (job={job_id})")
 
         elif func_name == "update_card":
+            # Get Redis timestamp to avoid clock skew (single source of truth)
+            from src.core.queue import RedisJobQueue
+            queued_at = time.time()  # Fallback to local time
+            if isinstance(queue, RedisJobQueue):
+                try:
+                    redis_time = queue._client.time()  # Returns (seconds, microseconds)
+                    queued_at = redis_time[0] + redis_time[1] / 1e6
+                except Exception as e:
+                    # P0 fix: Log clock skew fallback and record metric
+                    logger.warning(f"Redis TIME() failed for update_card (with_id), using local time (clock skew possible): {e}")
+                    record_clock_skew_fallback(location='update_card_with_id')
+
             # Atualizar card via board_operator
             job = Job(
                 agent="board_operator",
@@ -1306,10 +1620,26 @@ def execute_tool_call_with_id(
                     "from_chat": True,
                     "session_id": session_id
                 },
-                job_id=job_id  # Use pre-generated ID
+                job_id=job_id,  # Use pre-generated ID
+                metadata={
+                    "queued_at": queued_at,
+                    "session_id": session_id,
+                    "action": "update_card"
+                }
             )
-            queue.publish(job)
-            logger.info(f"📋 Enfileirado update_card (idempotente): {func_args.get('card_id', '')} (job={job_id})")
+
+            # Record optimistic job queued metric
+            record_optimistic_job_queued(
+                action="update_card",
+                session_id_present=(session_id is not None)
+            )
+
+            # ATOMIC: Enqueue job + emit SSE events in single Redis pipeline
+            from src.core.events import emit_job_queued
+            _publish_job_atomic(queue, job, [
+                (emit_job_queued, {"job_id": job_id, "action": "update_card", "args": func_args, "session_id": session_id})
+            ])
+            logger.info(f"📋 Enfileirado update_card (idempotente+atomic): {func_args.get('card_id', '')} (job={job_id})")
 
         elif func_name == "summarize_board":
             # Resumo do board (não enfileira job, responde inline)
@@ -1328,13 +1658,9 @@ def execute_tool_call_with_id(
             "params": func_args
         })
 
-        # Emit job_queued event
-        emit_sse_event("job_queued", {
-            "job_id": job_id,
-            "agent": func_args.get("agent") or func_name,
-            "from_chat": True,
-            "session_id": session_id
-        })
+        # Note: job_queued and card.pending events are now emitted
+        # immediately after queue.publish() for each tool type above
+        # (optimistic updates for UI)
 
     except Exception as e:
         logger.error(f"Failed to execute tool call {func_name} with ID {job_id}: {e}")
@@ -1501,6 +1827,7 @@ def get_llm_client():
 
 
 # Router endpoints
+@router.post("", response_model=ChatResponse)
 @router.post("/", response_model=ChatResponse)
 async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
     """
@@ -1545,17 +1872,17 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
     # Add user message
     history.append({
         "role": "user",
-        "content": body.message
+        "content": body.text
     })
 
     # Emit user chat message event
-    emit_chat_message(role="user", text=body.message, session_id=body.session_id)
+    emit_chat_message(role="user", text=body.text, session_id=body.session_id)
 
     # Check if user is responding to pending confirmation
     pending = get_pending_confirmation(body.session_id)
     if pending:
         # Use robust word-boundary matching with negation detection
-        intent = check_confirmation_intent(body.message)
+        intent = check_confirmation_intent(body.text)
 
         # Check for affirmative response
         if intent == "affirmative":
@@ -1564,8 +1891,9 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
             if not pending:
                 # Pending already executed or expired
                 assistant_message = "⚠️ A confirmação expirou. Por favor, solicite a ação novamente."
-                save_message_to_history(body.session_id, "user", body.message)
+                save_message_to_history(body.session_id, "user", body.text)
                 save_message_to_history(body.session_id, "assistant", assistant_message)
+                emit_chat_message(role="assistant", text=assistant_message, session_id=body.session_id)
                 return ChatResponse(
                     message=assistant_message,
                     role="assistant",
@@ -1586,7 +1914,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
                     f"ℹ️ Já confirmado anteriormente. Job ID: `{existing_job_id[:12]}`\n\n"
                     f"Nenhuma ação adicional foi executada (proteção contra duplicação)."
                 )
-                save_message_to_history(body.session_id, "user", body.message)
+                save_message_to_history(body.session_id, "user", body.text)
                 save_message_to_history(body.session_id, "assistant", assistant_message)
 
                 # Emit SSE event for duplicate confirmation
@@ -1595,6 +1923,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
                     "job_id": existing_job_id,
                     "tool_name": tool_call["name"]
                 })
+                emit_chat_message(role="assistant", text=assistant_message, session_id=body.session_id)
 
                 return ChatResponse(
                     message=assistant_message,
@@ -1621,7 +1950,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
                         f"Job ID: `{(existing_job_id or job_id)[:12]}`\n\n"
                         f"Nenhuma ação adicional foi executada (proteção contra duplicação)."
                     )
-                    save_message_to_history(body.session_id, "user", body.message)
+                    save_message_to_history(body.session_id, "user", body.text)
                     save_message_to_history(body.session_id, "assistant", assistant_message)
 
                     emit_sse_event("confirmation_already_executed", {
@@ -1629,6 +1958,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
                         "job_id": existing_job_id or job_id,
                         "tool_name": tool_call["name"]
                     })
+                    emit_chat_message(role="assistant", text=assistant_message, session_id=body.session_id)
 
                     return ChatResponse(
                         message=assistant_message,
@@ -1647,7 +1977,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
                 if job_id:
                     assistant_message += f" Job ID: `{job_id[:12]}`"
 
-                save_message_to_history(body.session_id, "user", body.message)
+                save_message_to_history(body.session_id, "user", body.text)
                 save_message_to_history(body.session_id, "assistant", assistant_message)
 
                 emit_sse_event("confirmation_accepted", {
@@ -1662,6 +1992,8 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
                     "job_id": job_id
                 })
 
+                emit_chat_message(role="assistant", text=assistant_message, session_id=body.session_id)
+
                 return ChatResponse(
                     message=assistant_message,
                     role="assistant",
@@ -1673,8 +2005,9 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
             except Exception as e:
                 logger.error(f"Failed to execute confirmed action: {e}")
                 error_msg = f"❌ Erro ao executar: {str(e)}"
-                save_message_to_history(body.session_id, "user", body.message)
+                save_message_to_history(body.session_id, "user", body.text)
                 save_message_to_history(body.session_id, "assistant", error_msg)
+                emit_chat_message(role="assistant", text=error_msg, session_id=body.session_id)
                 return ChatResponse(
                     message=error_msg,
                     role="assistant",
@@ -1689,7 +2022,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
             delete_pending_confirmation(body.session_id)
 
             assistant_message = "❌ Ação cancelada. Como posso ajudar?"
-            save_message_to_history(body.session_id, "user", body.message)
+            save_message_to_history(body.session_id, "user", body.text)
             save_message_to_history(body.session_id, "assistant", assistant_message)
 
             emit_sse_event("confirmation_rejected", {
@@ -1701,6 +2034,8 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
             log_to_audit(body.session_id, "confirmation_rejected", {
                 "tool_name": pending["tool_call"]["name"]
             })
+
+            emit_chat_message(role="assistant", text=assistant_message, session_id=body.session_id)
 
             return ChatResponse(
                 message=assistant_message,
@@ -1717,8 +2052,9 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
                 "⚠️ Resposta não reconhecida. "
                 "Diga **sim** para confirmar ou **não** para cancelar."
             )
-            save_message_to_history(body.session_id, "user", body.message)
+            save_message_to_history(body.session_id, "user", body.text)
             save_message_to_history(body.session_id, "assistant", assistant_message)
+            emit_chat_message(role="assistant", text=assistant_message, session_id=body.session_id)
 
             return ChatResponse(
                 message=assistant_message,
@@ -1730,11 +2066,11 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
             )
 
     # Save user message to history
-    save_message_to_history(body.session_id, "user", body.message)
+    save_message_to_history(body.session_id, "user", body.text)
 
     # Log user message to audit trail
     log_to_audit(body.session_id, "user_message", {
-        "texto": body.message[:180]  # Truncate to 180 chars for audit
+        "texto": body.text[:180]  # Truncate to 180 chars for audit
     })
 
     # Validate token count before LLM call (prevent cost explosions)
@@ -1765,7 +2101,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
     except ImportError:
         pass
 
-    # Call LLM with timing
+    # Call LLM with timing and 20s timeout
     import time
     start_time = time.time()
     try:
@@ -1777,7 +2113,46 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
         else:
             llm_messages = history
 
-        llm_response = llm_client.chat(messages=llm_messages, tools=tools)
+        # Wrap LLM call with 20s timeout
+        try:
+            llm_response = await asyncio.wait_for(
+                asyncio.to_thread(llm_client.chat, messages=llm_messages, tools=tools),
+                timeout=20.0
+            )
+        except asyncio.TimeoutError:
+            # LLM took too long - return fallback message
+            logger.warning(f"LLM timeout after 20s for session {body.session_id[:12]}")
+
+            fallback_message = "Recebi seu pedido e enfileirei a ação. Vou atualizando aqui."
+
+            # Save messages to history
+            save_message_to_history(body.session_id, "user", body.text)
+            save_message_to_history(body.session_id, "assistant", fallback_message)
+
+            # Emit timeout event
+            emit_sse_event("chat_timeout", {
+                "session_id": body.session_id,
+                "timeout_seconds": 20
+            })
+
+            # Emit assistant chat message via SSE
+            emit_chat_message(role="assistant", text=fallback_message, session_id=body.session_id)
+
+            # Record timeout metric
+            try:
+                from src.core.metrics import record_chat_request
+                record_chat_request("anthropic", "timeout", 20.0)
+            except ImportError:
+                pass
+
+            return ChatResponse(
+                message=fallback_message,
+                role="assistant",
+                tool_calls=[],
+                requires_approval=False,
+                proposal_id=None,
+                session_id=body.session_id
+            )
 
         # Calculate latency
         latency = time.time() - start_time
@@ -1832,7 +2207,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
             if not is_valid:
                 # Return validation error immediately (conversational repair)
                 assistant_message = validation_error
-                save_message_to_history(body.session_id, "user", body.message)
+                save_message_to_history(body.session_id, "user", body.text)
                 save_message_to_history(body.session_id, "assistant", assistant_message)
 
                 # Emit validation_error event for monitoring
@@ -1849,6 +2224,8 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
                     "error": validation_error,
                     "params": func_args
                 })
+
+                emit_chat_message(role="assistant", text=assistant_message, session_id=body.session_id)
 
                 return ChatResponse(
                     message=assistant_message,
