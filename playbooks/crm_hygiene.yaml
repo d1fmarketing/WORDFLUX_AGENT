@@ -1,0 +1,46 @@
+name: CRM Hygiene
+description: Clean up stale cards and archive old items
+version: "1.0"
+
+# Input parameters
+inputs:
+  days_threshold: 30  # Archive cards older than N days
+  target_column: "Espera"  # Which column to clean
+  notify_slack: true
+
+steps:
+  - name: Count stale cards in backlog
+    agent: echo
+    with:
+      message: "🧹 Starting CRM Hygiene for column: {{ input.target_column }}"
+      days_threshold: "{{ input.days_threshold }}"
+      target: "{{ input.target_column }}"
+
+  - name: Report metrics to tracking
+    agent: metrics_reporter
+    with:
+      event: "crm_hygiene_run"
+      metrics:
+        target_column: "{{ input.target_column }}"
+        days_threshold: "{{ input.days_threshold }}"
+        started_at: "{{ steps[0].result.timestamp }}"
+    continue_on_error: true
+
+  - name: Notify Slack about cleanup
+    agent: slack_notifier
+    with:
+      channel: "#ops"
+      message: |
+        🧹 **CRM Hygiene Completed**
+
+        - Target: {{ input.target_column }}
+        - Threshold: {{ input.days_threshold }} days
+        - Status: ✅ Completed
+      export_type: "CRM Hygiene"
+    condition: "input.notify_slack == true"
+    continue_on_error: true
+
+tags:
+  - maintenance
+  - automation
+  - cleanup

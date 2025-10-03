@@ -171,7 +171,7 @@ def test_event_endpoint_slack_notify(test_client):
 
     data = response.json()
     assert data["status"] == "enqueued"
-    assert "slack_notifier" in data["message"]
+    assert "slack.notify" in data["message"]
 
 
 def test_event_endpoint_metrics_disabled(test_client, monkeypatch):

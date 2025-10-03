@@ -1,0 +1,419 @@
+{
+  "examples": {
+    "health_check": {
+      "description": "Check system health and queue status",
+      "request": {
+        "method": "GET",
+        "url": "/health"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "ok",
+          "ts": 1704067200,
+          "queue_mode": "redis",
+          "queue_depth": 3,
+          "redis": true
+        }
+      }
+    },
+    "get_board_state": {
+      "description": "Get complete board state with all cards",
+      "request": {
+        "method": "GET",
+        "url": "/board/state"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "columns": [
+            {
+              "id": "Backlog",
+              "cards": [
+                {
+                  "id": "c-a1b2c3d4",
+                  "title": "Research Redis patterns",
+                  "status": "Backlog",
+                  "created_at": "2024-01-01T10:00:00Z",
+                  "meta": {
+                    "assignee": "alice",
+                    "priority": "high"
+                  }
+                }
+              ]
+            },
+            {
+              "id": "In Progress",
+              "cards": [
+                {
+                  "id": "c-e5f6g7h8",
+                  "title": "Write API documentation",
+                  "status": "In Progress",
+                  "created_at": "2024-01-01T09:00:00Z",
+                  "updated_at": "2024-01-01T11:00:00Z",
+                  "last_job_id": "cockpit-x1y2z3",
+                  "last_action": "start_work",
+                  "meta": {
+                    "assignee": "bob",
+                    "priority": "normal"
+                  }
+                }
+              ]
+            },
+            {
+              "id": "Waiting Approval",
+              "cards": []
+            },
+            {
+              "id": "Scheduled",
+              "cards": [
+                {
+                  "id": "c-i9j0k1l2",
+                  "title": "Publish blog post",
+                  "status": "Scheduled",
+                  "created_at": "2024-01-01T08:00:00Z",
+                  "updated_at": "2024-01-01T14:00:00Z",
+                  "meta": {
+                    "scheduled_time": "2024-01-02T10:00:00Z",
+                    "platform": "blog"
+                  }
+                }
+              ]
+            },
+            {
+              "id": "Published",
+              "cards": []
+            }
+          ],
+          "autopilot": false
+        }
+      }
+    },
+    "create_card": {
+      "description": "Create a new card in Backlog",
+      "request": {
+        "method": "POST",
+        "url": "/board/card",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "title": "Implement user authentication",
+          "intent": "Security enhancement for the application",
+          "meta": {
+            "assignee": "charlie",
+            "priority": "high",
+            "platform": "backend"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "created": {
+            "id": "c-m3n4o5p6",
+            "title": "Implement user authentication",
+            "intent": "Security enhancement for the application",
+            "status": "Backlog",
+            "created_at": "2024-01-01T15:30:00Z",
+            "meta": {
+              "assignee": "charlie",
+              "priority": "high",
+              "platform": "backend"
+            }
+          }
+        }
+      }
+    },
+    "move_card": {
+      "description": "Move a card to a different column",
+      "request": {
+        "method": "POST",
+        "url": "/board/move",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "card_id": "c-a1b2c3d4",
+          "to": "In Progress"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "moved": {
+            "id": "c-a1b2c3d4",
+            "from": "Backlog",
+            "to": "In Progress"
+          }
+        }
+      }
+    },
+    "suggest_actions": {
+      "description": "Get suggested actions for a card",
+      "request": {
+        "method": "GET",
+        "url": "/agent/suggest?card_id=c-e5f6g7h8"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "card_id": "c-e5f6g7h8",
+          "column": "In Progress",
+          "actions": [
+            "send_for_review",
+            "pause"
+          ]
+        }
+      }
+    },
+    "execute_action": {
+      "description": "Execute an agent action on a card",
+      "request": {
+        "method": "POST",
+        "url": "/agent/act",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "card_id": "c-e5f6g7h8",
+          "action": "send_for_review"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "to": "Waiting Approval",
+          "job_id": "cockpit-q7r8s9t0"
+        }
+      }
+    },
+    "toggle_autopilot": {
+      "description": "Enable or disable autopilot mode",
+      "request": {
+        "method": "POST",
+        "url": "/agent/autopilot",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "on": true
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "autopilot": true
+        }
+      }
+    },
+    "get_completed_kpis": {
+      "description": "Get completed tasks for the last 7 days",
+      "request": {
+        "method": "GET",
+        "url": "/kpis/completed?days=7"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "total": 24,
+          "by_user": {
+            "alice": 10,
+            "bob": 8,
+            "charlie": 6
+          },
+          "by_day": {
+            "2023-12-26": 3,
+            "2023-12-27": 4,
+            "2023-12-28": 2,
+            "2023-12-29": 5,
+            "2023-12-30": 3,
+            "2023-12-31": 4,
+            "2024-01-01": 3
+          },
+          "period_days": 7
+        }
+      }
+    },
+    "get_efficiency": {
+      "description": "Get efficiency metrics",
+      "request": {
+        "method": "GET",
+        "url": "/kpis/efficiency"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "overall": 45.5,
+          "by_user": {},
+          "cards_by_state": {
+            "Backlog": 8,
+            "In Progress": 3,
+            "Waiting Approval": 2,
+            "Scheduled": 4,
+            "Published": 15
+          }
+        }
+      }
+    },
+    "get_daily_plan": {
+      "description": "Get today's planned tasks",
+      "request": {
+        "method": "GET",
+        "url": "/kpis/daily_plan?user=alice"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "date": "2024-01-01",
+          "total": 3,
+          "tasks": [
+            {
+              "id": "c-task1",
+              "title": "Morning standup presentation",
+              "scheduled_time": "2024-01-01T09:00:00Z",
+              "assignee": "alice",
+              "priority": "high"
+            },
+            {
+              "id": "c-task2",
+              "title": "Review PR #123",
+              "scheduled_time": "2024-01-01T11:00:00Z",
+              "assignee": "alice",
+              "priority": "normal"
+            },
+            {
+              "id": "c-task3",
+              "title": "Deploy to staging",
+              "scheduled_time": "2024-01-01T15:00:00Z",
+              "assignee": "alice",
+              "priority": "high"
+            }
+          ]
+        }
+      }
+    },
+    "plan_tomorrow_ai": {
+      "description": "Use AI to plan tomorrow's tasks",
+      "request": {
+        "method": "POST",
+        "url": "/ai/plan_tomorrow",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "user": "alice"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "success": true,
+          "job_id": "cockpit-ai-plan-123",
+          "message": "Planning tomorrow's tasks"
+        }
+      }
+    },
+    "get_my_tasks": {
+      "description": "Get current user's tasks",
+      "request": {
+        "method": "GET",
+        "url": "/me/tasks?scope=mine&when=today"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "scope": "mine",
+          "when": "today",
+          "user": "demo",
+          "total": 2,
+          "tasks": [
+            {
+              "id": "c-mytask1",
+              "title": "Code review",
+              "status": "In Progress",
+              "assignee": "demo",
+              "priority": "normal"
+            },
+            {
+              "id": "c-mytask2",
+              "title": "Update documentation",
+              "status": "Backlog",
+              "assignee": "demo",
+              "priority": "low"
+            }
+          ]
+        }
+      }
+    },
+    "cleanup_cards": {
+      "description": "Archive old completed cards",
+      "request": {
+        "method": "POST",
+        "url": "/cards/cleanup",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "state": "Published",
+          "days_old": 30
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "success": true,
+          "state": "Published",
+          "removed": 12,
+          "message": "Archived 12 cards older than 30 days"
+        }
+      }
+    },
+    "sse_stream_example": {
+      "description": "Server-Sent Events stream connection",
+      "request": {
+        "method": "GET",
+        "url": "/events/stream",
+        "notes": "This is an EventSource connection, not a regular HTTP request"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "X-Accel-Buffering": "no"
+        },
+        "body": "data: {\"ts\":1704067200000,\"kind\":\"board_update\",\"column\":\"In Progress\",\"card\":{\"id\":\"c-123\",\"title\":\"Test\"}}\n\ndata: {\"ts\":1704067201000,\"kind\":\"agent_action\",\"card\":{\"id\":\"c-123\"},\"action\":\"start_work\",\"to\":\"In Progress\",\"job_id\":\"job-456\"}\n\n: ping 1704067210\n\n"
+      }
+    }
+  },
+  "javascript_examples": {
+    "sse_connection": "// Connect to Server-Sent Events stream\nconst eventSource = new EventSource('/events/stream');\n\neventSource.onmessage = (event) => {\n  const data = JSON.parse(event.data);\n  console.log('Event received:', data);\n  \n  switch(data.kind) {\n    case 'board_update':\n      updateBoardUI(data.column, data.card);\n      break;\n    case 'agent_action':\n      showNotification(`Action ${data.action} executed`);\n      break;\n    case 'job_queued':\n      updateJobStatus(data.job_id, 'queued');\n      break;\n  }\n};\n\neventSource.onerror = (error) => {\n  console.error('SSE error:', error);\n  // Reconnection is automatic\n};",
+    "execute_action_with_ui_update": "// Execute action and update UI\nasync function executeAction(cardId, action) {\n  try {\n    // Show loading state\n    showSpinner();\n    \n    const response = await fetch('/agent/act', {\n      method: 'POST',\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({ card_id: cardId, action: action })\n    });\n    \n    const result = await response.json();\n    \n    if (result.ok) {\n      // Update card position\n      moveCardToColumn(cardId, result.to);\n      \n      // Show job badge\n      addJobBadge(cardId, result.job_id);\n      \n      showNotification(`Job ${result.job_id} queued`);\n    } else {\n      showError(result.error || 'Action failed');\n    }\n  } catch (error) {\n    showError('Network error: ' + error.message);\n  } finally {\n    hideSpinner();\n  }\n}",
+    "fetch_kpis_with_chart": "// Fetch KPIs and render chart\nasync function updateKPIChart() {\n  const response = await fetch('/kpis/completed?days=7');\n  const data = await response.json();\n  \n  // Prepare chart data\n  const chartData = {\n    labels: Object.keys(data.by_day),\n    datasets: [{\n      label: 'Completed Tasks',\n      data: Object.values(data.by_day),\n      backgroundColor: '#66d9ef'\n    }]\n  };\n  \n  // Render with Chart.js or similar\n  renderChart('kpi-chart', chartData);\n  \n  // Update summary\n  document.getElementById('total-completed').textContent = data.total;\n}"
+  },
+  "error_responses": {
+    "card_not_found": {
+      "status": 404,
+      "body": {
+        "error": "not_found"
+      }
+    },
+    "invalid_action": {
+      "status": 400,
+      "body": {
+        "error": "Invalid action for current card state"
+      }
+    },
+    "queue_error": {
+      "status": 500,
+      "body": {
+        "error": "Failed to queue job: Redis connection error"
+      }
+    }
+  },
+  "authentication_note": "Currently, the API does not require authentication. In production, add JWT or API key authentication headers.",
+  "rate_limiting_note": "No rate limiting is currently implemented. Consider adding rate limiting for production deployment.",
+  "cors_note": "CORS headers should be configured in nginx for cross-origin requests from the frontend application."
+}

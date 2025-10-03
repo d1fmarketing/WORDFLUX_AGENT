@@ -1,0 +1,2216 @@
+<!DOCTYPE html>
+<html lang="pt-BR" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="WordFlux Cockpit - Agent-driven task management system">
+  <title>WordFlux Cockpit</title>
+  <style>
+    /* ============================================
+       1. CSS VARIABLES & DESIGN TOKENS
+       ============================================ */
+    :root {
+      /* Dark Mode (Default) */
+      --wf-bg: #0B0B0B;
+      --wf-panel: #2E2D2D;
+      --wf-border: #3D3939;
+      --wf-text: #FFFFFF;
+      --wf-muted: #696466;
+      --wf-primary: #E43045;
+      --wf-accent: #6E4CD9;
+      --wf-grad: linear-gradient(135deg, #E43045 0%, #6E4CD9 100%);
+
+      /* Semantic Colors */
+      --wf-success: #4ade80;
+      --wf-warning: #fbbf24;
+      --wf-error: #ef4444;
+      --wf-info: #3b82f6;
+
+      /* Shadows */
+      --wf-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5);
+      --wf-shadow-md: 0 4px 6px rgba(0, 0, 0, 0.3);
+      --wf-shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.4);
+
+      /* Spacing */
+      --spacing-xs: 4px;
+      --spacing-sm: 8px;
+      --spacing-md: 12px;
+      --spacing-lg: 16px;
+      --spacing-xl: 24px;
+
+      /* Typography */
+      --font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+      --font-size-xs: 12px;
+      --font-size-sm: 13px;
+      --font-size-base: 14px;
+      --font-size-lg: 16px;
+      --font-size-xl: 18px;
+      --font-size-2xl: 24px;
+
+      /* Layout */
+      --chat-width: 320px;
+      --metrics-width: 340px;
+      --header-height: 60px;
+    }
+
+    [data-theme="light"] {
+      --wf-bg: #F0F0F0;
+      --wf-panel: #FEFEFE;
+      --wf-border: #E0E0E0;
+      --wf-text: #0B0B0B;
+      --wf-muted: #696466;
+
+      --wf-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.1);
+      --wf-shadow-md: 0 4px 6px rgba(0, 0, 0, 0.07);
+      --wf-shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.1);
+    }
+
+    /* ============================================
+       2. RESET & BASE STYLES
+       ============================================ */
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html {
+      font-size: 16px;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    body {
+      font-family: var(--font-family);
+      font-size: var(--font-size-base);
+      line-height: 1.5;
+      color: var(--wf-text);
+      background-color: var(--wf-bg);
+      overflow: hidden;
+    }
+
+    /* Smooth transitions for theme changes */
+    * {
+      transition: background-color 0.3s ease,
+                  color 0.3s ease,
+                  border-color 0.3s ease,
+                  box-shadow 0.3s ease;
+    }
+
+    /* Disable transitions during theme change for instant feedback */
+    [data-theme-changing] * {
+      transition: none !important;
+    }
+
+    /* ============================================
+       3. LAYOUT - CSS GRID
+       ============================================ */
+    .app-container {
+      display: grid;
+      grid-template-columns: var(--chat-width) 1fr var(--metrics-width);
+      grid-template-areas: "chat board metrics";
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    .chat-panel {
+      grid-area: chat;
+      background: var(--wf-panel);
+      border-right: 1px solid var(--wf-border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .board-container {
+      grid-area: board;
+      background: var(--wf-bg);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .metrics-panel {
+      grid-area: metrics;
+      background: var(--wf-panel);
+      border-left: 1px solid var(--wf-border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .metrics-panel.collapsed {
+      transform: translateX(100%);
+    }
+
+    /* ============================================
+       4. HEADER
+       ============================================ */
+    .app-header {
+      height: var(--header-height);
+      background: var(--wf-panel);
+      border-bottom: 1px solid var(--wf-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 var(--spacing-lg);
+      flex-shrink: 0;
+    }
+
+    .header-title {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-sm);
+      font-weight: 700;
+      font-size: var(--font-size-xl);
+    }
+
+    .header-logo {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: var(--wf-grad);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-weight: 900;
+      font-size: 18px;
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-md);
+    }
+
+    .connection-status {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-sm);
+      font-size: var(--font-size-sm);
+      color: var(--wf-muted);
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--wf-success);
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    [data-connected="false"] .status-dot {
+      background: var(--wf-error);
+      animation: none;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    .theme-toggle {
+      background: transparent;
+      border: 1px solid var(--wf-border);
+      color: var(--wf-text);
+      width: 40px;
+      height: 40px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 20px;
+      transition: all 0.2s ease;
+    }
+
+    .theme-toggle:hover {
+      background: var(--wf-border);
+      border-color: var(--wf-primary);
+    }
+
+    .theme-toggle:focus-visible {
+      outline: 2px solid var(--wf-primary);
+      outline-offset: 2px;
+    }
+
+    /* ============================================
+       5. CHAT PANEL
+       ============================================ */
+    .chat-header {
+      padding: var(--spacing-lg);
+      border-bottom: 1px solid var(--wf-border);
+      flex-shrink: 0;
+    }
+
+    .chat-title {
+      font-size: var(--font-size-lg);
+      font-weight: 700;
+      margin-bottom: var(--spacing-xs);
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-sm);
+    }
+
+    .chat-subtitle {
+      font-size: var(--font-size-sm);
+      color: var(--wf-muted);
+    }
+
+    .chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: var(--spacing-lg);
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-md);
+    }
+
+    .chat-message {
+      display: flex;
+      gap: var(--spacing-sm);
+      animation: messageEnter 0.3s ease-out;
+    }
+
+    @keyframes messageEnter {
+      from {
+        opacity: 0;
+        transform: translateY(10px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .message-user {
+      flex-direction: row-reverse;
+    }
+
+    .message-avatar {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: var(--wf-grad);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-weight: 700;
+      font-size: var(--font-size-sm);
+      flex-shrink: 0;
+    }
+
+    .message-user .message-avatar {
+      background: var(--wf-border);
+      color: var(--wf-text);
+    }
+
+    .message-content {
+      max-width: 75%;
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-xs);
+    }
+
+    .message-text {
+      background: var(--wf-bg);
+      padding: var(--spacing-sm) var(--spacing-md);
+      border-radius: 12px;
+      font-size: var(--font-size-sm);
+      line-height: 1.5;
+    }
+
+    .message-user .message-text {
+      background: var(--wf-primary);
+      color: white;
+    }
+
+    .message-meta {
+      font-size: var(--font-size-xs);
+      color: var(--wf-muted);
+      padding: 0 var(--spacing-sm);
+    }
+
+    .message-user .message-meta {
+      text-align: right;
+    }
+
+    .chat-quick-actions {
+      padding: var(--spacing-md) var(--spacing-lg);
+      border-top: 1px solid var(--wf-border);
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--spacing-sm);
+      flex-shrink: 0;
+    }
+
+    .quick-action-chip {
+      background: var(--wf-bg);
+      border: 1px solid var(--wf-border);
+      color: var(--wf-text);
+      padding: var(--spacing-sm) var(--spacing-md);
+      border-radius: 16px;
+      font-size: var(--font-size-sm);
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .quick-action-chip:hover {
+      background: var(--wf-border);
+      border-color: var(--wf-primary);
+    }
+
+    .quick-action-chip:focus-visible {
+      outline: 2px solid var(--wf-primary);
+      outline-offset: 2px;
+    }
+
+    .chat-input-container {
+      padding: var(--spacing-lg);
+      border-top: 1px solid var(--wf-border);
+      flex-shrink: 0;
+    }
+
+    .chat-input-form {
+      display: flex;
+      gap: var(--spacing-sm);
+      align-items: center;
+    }
+
+    .chat-input {
+      flex: 1;
+      background: var(--wf-bg);
+      border: 1px solid var(--wf-border);
+      color: var(--wf-text);
+      padding: var(--spacing-md);
+      border-radius: 8px;
+      font-size: var(--font-size-base);
+      font-family: var(--font-family);
+    }
+
+    .chat-input:focus {
+      outline: none;
+      border-color: var(--wf-primary);
+    }
+
+    .chat-input::placeholder {
+      color: var(--wf-muted);
+    }
+
+    .chat-send-btn {
+      background: var(--wf-grad);
+      border: none;
+      color: white;
+      width: 44px;
+      height: 44px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: var(--font-size-xl);
+      transition: all 0.2s ease;
+    }
+
+    .chat-send-btn:hover:not(:disabled) {
+      transform: scale(1.05);
+      box-shadow: var(--wf-shadow-md);
+    }
+
+    .chat-send-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .chat-send-btn:focus-visible {
+      outline: 2px solid var(--wf-primary);
+      outline-offset: 2px;
+    }
+
+    .autopilot-toggle {
+      margin-top: var(--spacing-md);
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-sm);
+      font-size: var(--font-size-sm);
+      color: var(--wf-muted);
+    }
+
+    .toggle-switch {
+      position: relative;
+      width: 44px;
+      height: 24px;
+      background: var(--wf-border);
+      border-radius: 12px;
+      cursor: pointer;
+      transition: background 0.3s ease;
+    }
+
+    .toggle-switch.active {
+      background: var(--wf-primary);
+    }
+
+    .toggle-switch::after {
+      content: '';
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 20px;
+      height: 20px;
+      background: white;
+      border-radius: 50%;
+      transition: transform 0.3s ease;
+    }
+
+    .toggle-switch.active::after {
+      transform: translateX(20px);
+    }
+
+    /* ============================================
+       6. BOARD
+       ============================================ */
+    .board-header {
+      height: var(--header-height);
+      background: var(--wf-panel);
+      border-bottom: 1px solid var(--wf-border);
+      padding: 0 var(--spacing-lg);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+
+    .board-title {
+      font-size: var(--font-size-xl);
+      font-weight: 700;
+    }
+
+    .board-content {
+      flex: 1;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: var(--spacing-lg);
+    }
+
+    .board-columns {
+      display: flex;
+      gap: var(--spacing-lg);
+      height: 100%;
+      min-width: min-content;
+    }
+
+    .board-column {
+      flex: 0 0 280px;
+      display: flex;
+      flex-direction: column;
+      background: var(--wf-panel);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .column-header {
+      padding: var(--spacing-md) var(--spacing-lg);
+      border-bottom: 1px solid var(--wf-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+
+    .column-title {
+      font-weight: 700;
+      font-size: var(--font-size-base);
+    }
+
+    .column-count {
+      background: var(--wf-bg);
+      color: var(--wf-muted);
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: var(--font-size-xs);
+      font-weight: 600;
+    }
+
+    .column-cards {
+      flex: 1;
+      overflow-y: auto;
+      padding: var(--spacing-md);
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-md);
+    }
+
+    /* ============================================
+       7. BOARD CARDS
+       ============================================ */
+    .board-card {
+      background: var(--wf-bg);
+      border: 1px solid var(--wf-border);
+      border-radius: 8px;
+      padding: var(--spacing-md);
+      cursor: pointer;
+      transition: all 0.2s ease;
+      animation: cardEnter 0.3s ease-out;
+    }
+
+    @keyframes cardEnter {
+      from {
+        opacity: 0;
+        transform: translateY(-10px) scale(0.95);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+      }
+    }
+
+    .board-card.removing {
+      animation: cardExit 0.2s ease-in forwards;
+    }
+
+    @keyframes cardExit {
+      from {
+        opacity: 1;
+        transform: scale(1);
+      }
+      to {
+        opacity: 0;
+        transform: scale(0.9);
+      }
+    }
+
+    .board-card:hover {
+      border-color: var(--wf-primary);
+      box-shadow: var(--wf-shadow-md);
+      transform: translateY(-2px);
+    }
+
+    .board-card:focus-visible {
+      outline: 2px solid var(--wf-primary);
+      outline-offset: 2px;
+    }
+
+    .card-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: var(--spacing-sm);
+      margin-bottom: var(--spacing-sm);
+    }
+
+    .card-title {
+      font-weight: 600;
+      font-size: var(--font-size-base);
+      line-height: 1.4;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      flex: 1;
+    }
+
+    .card-menu {
+      background: transparent;
+      border: none;
+      color: var(--wf-muted);
+      cursor: pointer;
+      padding: 0;
+      font-size: var(--font-size-lg);
+      line-height: 1;
+      flex-shrink: 0;
+      width: 20px;
+      height: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .card-menu:hover {
+      color: var(--wf-text);
+    }
+
+    .card-tags {
+      display: flex;
+      gap: var(--spacing-xs);
+      flex-wrap: wrap;
+      margin-bottom: var(--spacing-sm);
+    }
+
+    .tag {
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: var(--font-size-xs);
+      font-weight: 600;
+      background: var(--wf-border);
+      color: var(--wf-text);
+    }
+
+    .tag-priority-high {
+      background: rgba(239, 68, 68, 0.2);
+      color: #ef4444;
+    }
+
+    .tag-priority-medium {
+      background: rgba(251, 191, 36, 0.2);
+      color: #fbbf24;
+    }
+
+    .tag-priority-low {
+      background: rgba(74, 222, 128, 0.2);
+      color: #4ade80;
+    }
+
+    .tag-type-feature {
+      background: rgba(110, 76, 217, 0.2);
+      color: var(--wf-accent);
+    }
+
+    .tag-type-bug {
+      background: rgba(228, 48, 69, 0.2);
+      color: var(--wf-primary);
+    }
+
+    .card-progress {
+      margin-bottom: var(--spacing-sm);
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-sm);
+    }
+
+    .progress-bar-container {
+      flex: 1;
+      height: 4px;
+      background: var(--wf-border);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+
+    .progress-bar-fill {
+      height: 100%;
+      background: var(--wf-grad);
+      transition: width 0.3s ease;
+    }
+
+    .progress-label {
+      font-size: var(--font-size-xs);
+      color: var(--wf-muted);
+      font-weight: 600;
+      min-width: 35px;
+      text-align: right;
+    }
+
+    .card-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .card-meta {
+      display: flex;
+      gap: var(--spacing-md);
+    }
+
+    .meta-item {
+      font-size: var(--font-size-xs);
+      color: var(--wf-muted);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .card-assignee {
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: var(--wf-grad);
+      color: white;
+      font-size: var(--font-size-xs);
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* Empty State */
+    .empty-state {
+      padding: var(--spacing-xl);
+      text-align: center;
+      color: var(--wf-muted);
+    }
+
+    .empty-icon {
+      width: 48px;
+      height: 48px;
+      margin: 0 auto var(--spacing-md);
+      opacity: 0.5;
+    }
+
+    .empty-title {
+      font-size: var(--font-size-base);
+      font-weight: 600;
+      margin-bottom: var(--spacing-xs);
+      color: var(--wf-text);
+    }
+
+    .empty-description {
+      font-size: var(--font-size-sm);
+    }
+
+    /* ============================================
+       8. METRICS PANEL
+       ============================================ */
+    .metrics-header {
+      padding: var(--spacing-lg);
+      border-bottom: 1px solid var(--wf-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+
+    .metrics-title {
+      font-size: var(--font-size-lg);
+      font-weight: 700;
+    }
+
+    .metrics-toggle {
+      background: transparent;
+      border: 1px solid var(--wf-border);
+      color: var(--wf-text);
+      width: 32px;
+      height: 32px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: var(--font-size-base);
+    }
+
+    .metrics-toggle:hover {
+      background: var(--wf-border);
+    }
+
+    .metrics-content {
+      flex: 1;
+      overflow-y: auto;
+      padding: var(--spacing-lg);
+    }
+
+    .metrics-section {
+      margin-bottom: var(--spacing-xl);
+    }
+
+    .section-title {
+      font-size: var(--font-size-base);
+      font-weight: 700;
+      margin-bottom: var(--spacing-md);
+    }
+
+    .metric-item {
+      margin-bottom: var(--spacing-md);
+    }
+
+    .metric-label {
+      font-size: var(--font-size-sm);
+      color: var(--wf-muted);
+      margin-bottom: var(--spacing-xs);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .metric-value {
+      font-weight: 700;
+      color: var(--wf-text);
+    }
+
+    .metric-bar {
+      height: 6px;
+      background: var(--wf-border);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+
+    .metric-bar-fill {
+      height: 100%;
+      background: var(--wf-grad);
+      transition: width 0.3s ease;
+    }
+
+    /* Donut Charts */
+    .efficiency-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: var(--spacing-md);
+      margin-top: var(--spacing-md);
+    }
+
+    .donut-chart {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--spacing-xs);
+    }
+
+    .donut-circle {
+      width: 60px;
+      height: 60px;
+      border-radius: 50%;
+      background: conic-gradient(
+        var(--wf-primary) 0% var(--chart-value, 0%),
+        var(--wf-border) var(--chart-value, 0%) 100%
+      );
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .donut-inner {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      background: var(--wf-panel);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: var(--font-size-sm);
+    }
+
+    .donut-label {
+      font-size: var(--font-size-xs);
+      color: var(--wf-muted);
+      text-align: center;
+    }
+
+    /* Daily Plan */
+    .plan-list {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-sm);
+    }
+
+    .plan-item {
+      display: flex;
+      gap: var(--spacing-sm);
+      padding: var(--spacing-sm);
+      background: var(--wf-bg);
+      border-radius: 6px;
+      font-size: var(--font-size-sm);
+    }
+
+    .plan-time {
+      color: var(--wf-muted);
+      font-weight: 600;
+      min-width: 45px;
+    }
+
+    .plan-task {
+      color: var(--wf-text);
+    }
+
+    /* ============================================
+       9. UTILITIES
+       ============================================ */
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border-width: 0;
+    }
+
+    /* Focus Styles */
+    *:focus {
+      outline: none;
+    }
+
+    *:focus-visible {
+      outline: 2px solid var(--wf-primary);
+      outline-offset: 2px;
+    }
+
+    /* Scrollbar Styles */
+    ::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: var(--wf-panel);
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: var(--wf-border);
+      border-radius: 4px;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+      background: var(--wf-muted);
+    }
+
+    /* ============================================
+       10. RESPONSIVE DESIGN
+       ============================================ */
+    @media (max-width: 1199px) {
+      .app-container {
+        grid-template-columns: var(--chat-width) 1fr;
+        grid-template-areas: "chat board";
+      }
+
+      .metrics-panel {
+        position: fixed;
+        right: 0;
+        top: 0;
+        height: 100vh;
+        z-index: 100;
+        box-shadow: var(--wf-shadow-lg);
+      }
+
+      .metrics-panel:not(.expanded) {
+        transform: translateX(100%);
+      }
+    }
+
+    @media (max-width: 767px) {
+      .app-container {
+        grid-template-columns: 1fr;
+        grid-template-areas: "board";
+      }
+
+      .chat-panel {
+        position: fixed;
+        left: 0;
+        top: 0;
+        height: 100vh;
+        z-index: 100;
+        transform: translateX(-100%);
+        transition: transform 0.3s ease;
+        box-shadow: var(--wf-shadow-lg);
+      }
+
+      .chat-panel.expanded {
+        transform: translateX(0);
+      }
+
+      .board-columns {
+        flex-direction: column;
+      }
+
+      .board-column {
+        flex: 0 0 auto;
+        min-height: 300px;
+      }
+    }
+
+    /* ============================================
+       11. LOADING & SKELETON STATES
+       ============================================ */
+    @keyframes shimmer {
+      0% { background-position: -1000px 0; }
+      100% { background-position: 1000px 0; }
+    }
+
+    .skeleton {
+      background: linear-gradient(
+        90deg,
+        var(--wf-panel) 0%,
+        var(--wf-border) 50%,
+        var(--wf-panel) 100%
+      );
+      background-size: 1000px 100%;
+      animation: shimmer 2s infinite;
+      border-radius: 4px;
+    }
+
+    .skeleton-card {
+      width: 100%;
+      height: 120px;
+      margin-bottom: var(--spacing-md);
+    }
+
+    .skeleton-message {
+      width: 75%;
+      height: 60px;
+      margin-bottom: var(--spacing-md);
+    }
+
+    /* ============================================
+       12. NOTIFICATIONS
+       ============================================ */
+    .notification-container {
+      position: fixed;
+      top: var(--spacing-lg);
+      right: var(--spacing-lg);
+      z-index: 1000;
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-sm);
+      pointer-events: none;
+    }
+
+    .notification {
+      background: var(--wf-panel);
+      border: 1px solid var(--wf-border);
+      border-radius: 8px;
+      padding: var(--spacing-md);
+      box-shadow: var(--wf-shadow-lg);
+      min-width: 300px;
+      pointer-events: auto;
+      animation: notificationEnter 0.3s ease-out;
+    }
+
+    @keyframes notificationEnter {
+      from {
+        opacity: 0;
+        transform: translateX(100px);
+      }
+      to {
+        opacity: 1;
+        transform: translateX(0);
+      }
+    }
+
+    .notification.removing {
+      animation: notificationExit 0.2s ease-in forwards;
+    }
+
+    @keyframes notificationExit {
+      from {
+        opacity: 1;
+        transform: translateX(0);
+      }
+      to {
+        opacity: 0;
+        transform: translateX(100px);
+      }
+    }
+
+    .notification-success {
+      border-left: 4px solid var(--wf-success);
+    }
+
+    .notification-error {
+      border-left: 4px solid var(--wf-error);
+    }
+
+    .notification-info {
+      border-left: 4px solid var(--wf-info);
+    }
+
+    .notification-title {
+      font-weight: 600;
+      margin-bottom: var(--spacing-xs);
+    }
+
+    .notification-message {
+      font-size: var(--font-size-sm);
+      color: var(--wf-muted);
+    }
+  </style>
+</head>
+<body>
+  <div class="app-container" role="application" aria-label="WordFlux Cockpit">
+    <!-- Chat Panel -->
+    <aside class="chat-panel" role="complementary" aria-label="Chat com assistente">
+      <div class="chat-header">
+        <div class="chat-title">
+          <span style="color: var(--wf-primary);">●</span> WordFlux
+        </div>
+        <div class="chat-subtitle">IA pronta para comandar o fluxo</div>
+      </div>
+
+      <div class="chat-messages" role="log" aria-live="polite" aria-atomic="false">
+        <!-- Initial message -->
+        <div class="chat-message message-assistant">
+          <div class="message-avatar">W</div>
+          <div class="message-content">
+            <div class="message-text">
+              Olá! Posso criar, mover e resumir tarefas para você.<br>
+              Experimente "Crie uma tarefa em Doing" ou "Resumo do quadro".
+            </div>
+            <div class="message-meta">
+              <span class="timestamp">Agora</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="chat-quick-actions">
+        <button class="quick-action-chip" data-action="plan">Planeje o amanhã</button>
+        <button class="quick-action-chip" data-action="my-tasks">Mostrar minhas tarefas</button>
+        <button class="quick-action-chip" data-action="clear">Limpar Concluído</button>
+      </div>
+
+      <div class="chat-input-container">
+        <form class="chat-input-form">
+          <input
+            type="text"
+            class="chat-input"
+            placeholder="Digite sua mensagem..."
+            aria-label="Digite sua mensagem"
+            autocomplete="off"
+          />
+          <button type="submit" class="chat-send-btn" aria-label="Enviar mensagem">
+            →
+          </button>
+        </form>
+
+        <div class="autopilot-toggle">
+          <div class="toggle-switch" role="switch" aria-checked="false" aria-label="Ativar autopilot" tabindex="0"></div>
+          <span>Autopilot: Agente age automaticamente</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Board Container -->
+    <div class="board-container" role="main">
+      <div class="board-header">
+        <h1 class="board-title">Quadro</h1>
+        <div class="header-actions">
+          <div class="connection-status" data-connected="false">
+            <span class="status-dot"></span>
+            <span class="status-label">Conectando...</span>
+          </div>
+          <button class="theme-toggle" aria-label="Alternar tema" title="Alternar tema">
+            ☀️
+          </button>
+        </div>
+      </div>
+
+      <div class="board-content">
+        <div class="board-columns">
+          <!-- Backlog Column -->
+          <section class="board-column" role="region" aria-label="Espera">
+            <div class="column-header">
+              <h2 class="column-title">Espera</h2>
+              <span class="column-count">0</span>
+            </div>
+            <div class="column-cards" data-column="backlog" role="list">
+              <div class="empty-state">
+                <svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="3" y="3" width="18" height="18" rx="2"/>
+                </svg>
+                <div class="empty-title">Nenhum card aqui</div>
+                <div class="empty-description">Cards aparecerão aqui quando criados</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- In Progress Column -->
+          <section class="board-column" role="region" aria-label="Produção">
+            <div class="column-header">
+              <h2 class="column-title">Produção</h2>
+              <span class="column-count">0</span>
+            </div>
+            <div class="column-cards" data-column="doing" role="list">
+              <div class="empty-state">
+                <svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="3" y="3" width="18" height="18" rx="2"/>
+                </svg>
+                <div class="empty-title">Nenhum card aqui</div>
+                <div class="empty-description">Cards em progresso aparecerão aqui</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Review Column -->
+          <section class="board-column" role="region" aria-label="Aprovação">
+            <div class="column-header">
+              <h2 class="column-title">Aprovação</h2>
+              <span class="column-count">0</span>
+            </div>
+            <div class="column-cards" data-column="review" role="list">
+              <div class="empty-state">
+                <svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="3" y="3" width="18" height="18" rx="2"/>
+                </svg>
+                <div class="empty-title">Nenhum card aqui</div>
+                <div class="empty-description">Cards aguardando aprovação aparecerão aqui</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Scheduled Column -->
+          <section class="board-column" role="region" aria-label="Agendado">
+            <div class="column-header">
+              <h2 class="column-title">Agendado</h2>
+              <span class="column-count">0</span>
+            </div>
+            <div class="column-cards" data-column="scheduled" role="list">
+              <div class="empty-state">
+                <svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="3" y="3" width="18" height="18" rx="2"/>
+                </svg>
+                <div class="empty-title">Nenhum card aqui</div>
+                <div class="empty-description">Cards agendados aparecerão aqui</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Done Column -->
+          <section class="board-column" role="region" aria-label="Finalizado">
+            <div class="column-header">
+              <h2 class="column-title">Finalizado</h2>
+              <span class="column-count">0</span>
+            </div>
+            <div class="column-cards" data-column="done" role="list">
+              <div class="empty-state">
+                <svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="3" y="3" width="18" height="18" rx="2"/>
+                </svg>
+                <div class="empty-title">Nenhum card aqui</div>
+                <div class="empty-description">Cards finalizados aparecerão aqui</div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <!-- Metrics Panel -->
+    <aside class="metrics-panel" role="complementary" aria-label="Métricas e estatísticas">
+      <div class="metrics-header">
+        <h2 class="metrics-title">Métricas</h2>
+        <button class="metrics-toggle" aria-label="Recolher painel" title="Recolher">
+          «
+        </button>
+      </div>
+
+      <div class="metrics-content">
+        <!-- Tasks Completed Section -->
+        <section class="metrics-section">
+          <h3 class="section-title">Tarefas Concluídas</h3>
+
+          <div class="metric-item">
+            <div class="metric-label">
+              <span>Esta semana</span>
+              <span class="metric-value">12</span>
+            </div>
+            <div class="metric-bar">
+              <div class="metric-bar-fill" style="width: 80%;"></div>
+            </div>
+          </div>
+
+          <div class="metric-item">
+            <div class="metric-label">
+              <span>Este mês</span>
+              <span class="metric-value">45</span>
+            </div>
+            <div class="metric-bar">
+              <div class="metric-bar-fill" style="width: 90%;"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Efficiency Section -->
+        <section class="metrics-section">
+          <h3 class="section-title">Eficiência</h3>
+
+          <div class="efficiency-grid">
+            <div class="donut-chart">
+              <div class="donut-circle" style="--chart-value: 92%;">
+                <div class="donut-inner">92%</div>
+              </div>
+              <div class="donut-label">WIP</div>
+            </div>
+
+            <div class="donut-chart">
+              <div class="donut-circle" style="--chart-value: 85%;">
+                <div class="donut-inner">85%</div>
+              </div>
+              <div class="donut-label">Vel</div>
+            </div>
+
+            <div class="donut-chart">
+              <div class="donut-circle" style="--chart-value: 78%;">
+                <div class="donut-inner">78%</div>
+              </div>
+              <div class="donut-label">Qua</div>
+            </div>
+
+            <div class="donut-chart">
+              <div class="donut-circle" style="--chart-value: 95%;">
+                <div class="donut-inner">95%</div>
+              </div>
+              <div class="donut-label">Ent</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Daily Plan Section -->
+        <section class="metrics-section">
+          <h3 class="section-title">Plano Diário</h3>
+
+          <div class="plan-list">
+            <div class="plan-item">
+              <span class="plan-time">09:00</span>
+              <span class="plan-task">Daily Standup</span>
+            </div>
+            <div class="plan-item">
+              <span class="plan-time">14:00</span>
+              <span class="plan-task">Code Review</span>
+            </div>
+            <div class="plan-item">
+              <span class="plan-time">16:00</span>
+              <span class="plan-task">Deploy Release</span>
+            </div>
+          </div>
+        </section>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Notification Container -->
+  <div class="notification-container" role="status" aria-live="polite"></div>
+
+  <!-- Screen Reader Announcements -->
+  <div class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+
+  <script>
+    // ============================================
+    // 1. STATE MANAGEMENT
+    // ============================================
+    const AppState = {
+      session_id: `sess-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      theme: 'dark',
+      autopilot: false,
+      connected: false,
+      board: {
+        backlog: [],
+        doing: [],
+        review: [],
+        scheduled: [],
+        done: []
+      },
+      metrics: {
+        weekCompleted: 12,
+        monthCompleted: 45,
+        efficiency: { wip: 92, velocity: 85, quality: 78, delivery: 95 }
+      },
+
+      update(key, value) {
+        this[key] = value;
+        window.dispatchEvent(new CustomEvent('state-change', {
+          detail: { key, value }
+        }));
+      }
+    };
+
+    // ============================================
+    // 2. UTILITIES
+    // ============================================
+    function escapeHTML(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    function formatTime(date) {
+      if (!date) return '';
+      const d = new Date(date);
+      return d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+    }
+
+    function getInitials(name) {
+      if (!name) return '?';
+      return name
+        .split(' ')
+        .map(n => n[0])
+        .join('')
+        .toUpperCase()
+        .substr(0, 2);
+    }
+
+    function announce(message) {
+      const liveRegion = document.querySelector('.sr-only[role="status"]');
+      if (liveRegion) {
+        liveRegion.textContent = message;
+        setTimeout(() => liveRegion.textContent = '', 1000);
+      }
+    }
+
+    // ============================================
+    // 3. THEME MANAGEMENT
+    // ============================================
+    const ThemeManager = {
+      init() {
+        const saved = localStorage.getItem('wf-theme');
+        const system = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        const theme = saved || system;
+
+        this.setTheme(theme, false);
+
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
+          if (!localStorage.getItem('wf-theme')) {
+            this.setTheme(e.matches ? 'dark' : 'light', false);
+          }
+        });
+      },
+
+      setTheme(theme, save = true) {
+        document.documentElement.dataset.theme = theme;
+        AppState.theme = theme;
+
+        if (save) {
+          localStorage.setItem('wf-theme', theme);
+        }
+
+        const toggle = document.querySelector('.theme-toggle');
+        if (toggle) {
+          toggle.setAttribute('aria-label', theme === 'dark' ? 'Ativar modo claro' : 'Ativar modo escuro');
+          toggle.textContent = theme === 'dark' ? '☀️' : '🌙';
+        }
+      },
+
+      toggle() {
+        document.documentElement.dataset.themeChanging = '';
+
+        const newTheme = AppState.theme === 'dark' ? 'light' : 'dark';
+        this.setTheme(newTheme);
+
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            delete document.documentElement.dataset.themeChanging;
+          });
+        });
+      }
+    };
+
+    // ============================================
+    // 4. NOTIFICATION SYSTEM
+    // ============================================
+    const NotificationManager = {
+      show(type, title, message, duration = 5000) {
+        const container = document.querySelector('.notification-container');
+        const notification = document.createElement('div');
+        notification.className = `notification notification-${type}`;
+        notification.innerHTML = `
+          <div class="notification-title">${escapeHTML(title)}</div>
+          <div class="notification-message">${escapeHTML(message)}</div>
+        `;
+
+        container.appendChild(notification);
+
+        setTimeout(() => {
+          notification.classList.add('removing');
+          notification.addEventListener('animationend', () => notification.remove(), { once: true });
+        }, duration);
+      }
+    };
+
+    // ============================================
+    // 5. CHAT MANAGEMENT
+    // ============================================
+    const ChatManager = {
+      messagesContainer: null,
+      inputForm: null,
+      inputField: null,
+
+      init() {
+        this.messagesContainer = document.querySelector('.chat-messages');
+        this.inputForm = document.querySelector('.chat-input-form');
+        this.inputField = document.querySelector('.chat-input');
+
+        this.inputForm.addEventListener('submit', (e) => {
+          e.preventDefault();
+          this.sendMessage();
+        });
+
+        // Quick actions
+        document.querySelectorAll('.quick-action-chip').forEach(chip => {
+          chip.addEventListener('click', () => {
+            const action = chip.dataset.action;
+            const messages = {
+              'plan': 'Planeje o amanhã',
+              'my-tasks': 'Mostre minhas tarefas',
+              'clear': 'Limpe os cards concluídos'
+            };
+            this.inputField.value = messages[action] || '';
+            this.sendMessage();
+          });
+        });
+      },
+
+      async sendMessage() {
+        const message = this.inputField.value.trim();
+        if (!message) return;
+
+        // Clear input
+        this.inputField.value = '';
+
+        // Add user message
+        this.addMessage('user', message);
+
+        // Show loading state
+        const loadingId = this.addMessage('assistant', 'Pensando...', null, true);
+
+        try {
+          const response = await fetch('/chat/', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              message: message,
+              session_id: AppState.session_id
+            }),
+            signal: AbortSignal.timeout(30000)
+          });
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+          }
+
+          const data = await response.json();
+
+          // Remove loading message
+          this.removeMessage(loadingId);
+
+          // Agent response will come via SSE, but if immediate response:
+          if (data.message) {
+            this.addMessage('assistant', data.message);
+          }
+
+        } catch (error) {
+          this.removeMessage(loadingId);
+
+          let errorMsg = 'Erro ao enviar mensagem';
+          if (error.name === 'AbortError') {
+            errorMsg = 'Timeout: O servidor demorou muito para responder';
+          } else {
+            errorMsg = `Erro: ${error.message}`;
+          }
+
+          this.addMessage('system', errorMsg);
+          NotificationManager.show('error', 'Erro', errorMsg);
+        }
+      },
+
+      addMessage(role, content, timestamp = null, isLoading = false) {
+        const messageId = `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+        // Remove empty state if exists
+        const emptyState = this.messagesContainer.querySelector('.empty-state');
+        if (emptyState) emptyState.remove();
+
+        const message = document.createElement('div');
+        message.className = `chat-message message-${role}`;
+        message.dataset.messageId = messageId;
+
+        if (isLoading) {
+          message.dataset.loading = 'true';
+        }
+
+        const avatar = role === 'assistant' ? 'W' : role === 'user' ? 'U' : 'S';
+        const time = timestamp ? formatTime(timestamp) : formatTime(new Date());
+
+        message.innerHTML = `
+          <div class="message-avatar">${avatar}</div>
+          <div class="message-content">
+            <div class="message-text">${escapeHTML(content)}</div>
+            <div class="message-meta">
+              <span class="timestamp">${time}</span>
+            </div>
+          </div>
+        `;
+
+        this.messagesContainer.appendChild(message);
+        message.scrollIntoView({ behavior: 'smooth', block: 'end' });
+
+        return messageId;
+      },
+
+      removeMessage(messageId) {
+        const message = this.messagesContainer.querySelector(`[data-message-id="${messageId}"]`);
+        if (message) {
+          message.remove();
+        }
+      },
+
+      handleSSEMessage(event) {
+        // SSE will send chat_message events
+        if (event.message) {
+          this.addMessage('assistant', event.message, event.timestamp);
+        }
+      }
+    };
+
+    // ============================================
+    // 6. BOARD MANAGEMENT
+    // ============================================
+    const BoardManager = {
+      columns: null,
+
+      init() {
+        this.columns = {
+          backlog: document.querySelector('[data-column="backlog"]'),
+          doing: document.querySelector('[data-column="doing"]'),
+          review: document.querySelector('[data-column="review"]'),
+          scheduled: document.querySelector('[data-column="scheduled"]'),
+          done: document.querySelector('[data-column="done"]')
+        };
+
+        // Add event delegation for card clicks
+        document.querySelector('.board-content').addEventListener('click', (e) => {
+          const card = e.target.closest('.board-card');
+          if (card) {
+            this.handleCardClick(card);
+          }
+        });
+      },
+
+      createCard(cardData) {
+        const { id, title, tags = [], progress, attachments = 0, comments = 0, assignee } = cardData;
+
+        const card = document.createElement('article');
+        card.className = 'board-card';
+        card.dataset.cardId = id;
+        card.tabIndex = 0;
+        card.setAttribute('role', 'article');
+        card.setAttribute('aria-label', `Card: ${title}`);
+
+        let html = `
+          <div class="card-header">
+            <h3 class="card-title">${escapeHTML(title)}</h3>
+            <button class="card-menu" aria-label="Ações do card">⋮</button>
+          </div>
+        `;
+
+        if (tags.length > 0) {
+          html += `
+            <div class="card-tags">
+              ${tags.map(tag => `<span class="tag tag-${tag.type || 'default'}">${escapeHTML(tag.label)}</span>`).join('')}
+            </div>
+          `;
+        }
+
+        if (progress != null) {
+          html += `
+            <div class="card-progress">
+              <div class="progress-bar-container">
+                <div class="progress-bar-fill" style="width: ${progress}%;"></div>
+              </div>
+              <span class="progress-label">${progress}%</span>
+            </div>
+          `;
+        }
+
+        html += `
+          <div class="card-footer">
+            <div class="card-meta">
+              ${attachments > 0 ? `<span class="meta-item">📎 ${attachments}</span>` : ''}
+              ${comments > 0 ? `<span class="meta-item">💬 ${comments}</span>` : ''}
+            </div>
+            ${assignee ? `
+              <div class="card-assignee" title="${assignee.name}">
+                ${assignee.avatar || getInitials(assignee.name)}
+              </div>
+            ` : ''}
+          </div>
+        `;
+
+        card.innerHTML = html;
+        return card;
+      },
+
+      addCard(columnId, cardData) {
+        const column = this.columns[columnId];
+        if (!column) return;
+
+        // Remove empty state
+        const emptyState = column.querySelector('.empty-state');
+        if (emptyState) emptyState.remove();
+
+        const card = this.createCard(cardData);
+        column.appendChild(card);
+
+        // Update count
+        this.updateColumnCount(columnId);
+
+        // Add to state
+        AppState.board[columnId].push(cardData);
+
+        announce(`Card adicionado a ${this.getColumnName(columnId)}`);
+      },
+
+      removeCard(cardId) {
+        const card = document.querySelector(`[data-card-id="${cardId}"]`);
+        if (!card) return;
+
+        const column = card.closest('[data-column]');
+        const columnId = column?.dataset.column;
+
+        card.classList.add('removing');
+        card.addEventListener('animationend', () => {
+          card.remove();
+
+          // Update count
+          if (columnId) {
+            this.updateColumnCount(columnId);
+
+            // Show empty state if needed
+            if (column.children.length === 0) {
+              this.showEmptyState(column);
+            }
+          }
+        }, { once: true });
+
+        // Remove from state
+        if (columnId) {
+          AppState.board[columnId] = AppState.board[columnId].filter(c => c.id !== cardId);
+        }
+      },
+
+      moveCard(cardId, fromColumn, toColumn) {
+        const card = document.querySelector(`[data-card-id="${cardId}"]`);
+        if (!card) return;
+
+        const targetColumn = this.columns[toColumn];
+        if (!targetColumn) return;
+
+        // Remove empty state from target
+        const emptyState = targetColumn.querySelector('.empty-state');
+        if (emptyState) emptyState.remove();
+
+        // Move card
+        targetColumn.appendChild(card);
+
+        // Update counts
+        this.updateColumnCount(fromColumn);
+        this.updateColumnCount(toColumn);
+
+        // Update state
+        const cardData = AppState.board[fromColumn].find(c => c.id === cardId);
+        if (cardData) {
+          AppState.board[fromColumn] = AppState.board[fromColumn].filter(c => c.id !== cardId);
+          AppState.board[toColumn].push(cardData);
+        }
+
+        announce(`Card movido para ${this.getColumnName(toColumn)}`);
+      },
+
+      updateColumnCount(columnId) {
+        const column = this.columns[columnId];
+        if (!column) return;
+
+        const cards = column.querySelectorAll('.board-card');
+        const count = cards.length;
+
+        const countBadge = column.closest('.board-column').querySelector('.column-count');
+        if (countBadge) {
+          countBadge.textContent = count;
+        }
+      },
+
+      showEmptyState(column) {
+        const columnId = column.dataset.column;
+        const names = {
+          backlog: 'Cards aparecerão aqui quando criados',
+          doing: 'Cards em progresso aparecerão aqui',
+          review: 'Cards aguardando aprovação aparecerão aqui',
+          scheduled: 'Cards agendados aparecerão aqui',
+          done: 'Cards finalizados aparecerão aqui'
+        };
+
+        column.innerHTML = `
+          <div class="empty-state">
+            <svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="3" width="18" height="18" rx="2"/>
+            </svg>
+            <div class="empty-title">Nenhum card aqui</div>
+            <div class="empty-description">${names[columnId] || ''}</div>
+          </div>
+        `;
+      },
+
+      getColumnName(columnId) {
+        const names = {
+          backlog: 'Espera',
+          doing: 'Produção',
+          review: 'Aprovação',
+          scheduled: 'Agendado',
+          done: 'Finalizado'
+        };
+        return names[columnId] || columnId;
+      },
+
+      handleCardClick(card) {
+        console.log('Card clicked:', card.dataset.cardId);
+        // TODO: Open card modal or show details
+      },
+
+      handleBoardUpdate(event) {
+        // Handle SSE board_update events
+        if (event.action === 'add') {
+          this.addCard(event.column, event.card);
+        } else if (event.action === 'remove') {
+          this.removeCard(event.card_id);
+        } else if (event.action === 'move') {
+          this.moveCard(event.card_id, event.from_column, event.to_column);
+        }
+      },
+
+      loadMockData() {
+        // Add some mock cards for testing
+        this.addCard('backlog', {
+          id: 'card-1',
+          title: 'Implement dark mode toggle',
+          tags: [
+            { label: 'urgent', type: 'priority-high' },
+            { label: 'feature', type: 'type-feature' }
+          ],
+          progress: 0,
+          attachments: 2,
+          comments: 1,
+          assignee: { name: 'John Doe' }
+        });
+
+        this.addCard('doing', {
+          id: 'card-2',
+          title: 'Fix authentication bug',
+          tags: [
+            { label: 'bug', type: 'type-bug' },
+            { label: 'high', type: 'priority-high' }
+          ],
+          progress: 60,
+          comments: 3,
+          assignee: { name: 'Jane Smith' }
+        });
+
+        this.addCard('review', {
+          id: 'card-3',
+          title: 'Update documentation',
+          tags: [
+            { label: 'docs', type: 'default' },
+            { label: 'low', type: 'priority-low' }
+          ],
+          progress: 90,
+          attachments: 1,
+          assignee: { name: 'Bob Johnson' }
+        });
+      }
+    };
+
+    // ============================================
+    // 7. SSE MANAGEMENT
+    // ============================================
+    class SSEManager {
+      constructor() {
+        this.eventSource = null;
+        this.reconnectTimeout = null;
+        this.heartbeatTimeout = null;
+        this.reconnectAttempts = 0;
+      }
+
+      connect() {
+        try {
+          this.eventSource = new EventSource('/events/stream');
+
+          this.eventSource.onmessage = (e) => {
+            // Handle heartbeat
+            if (e.data.startsWith(': hb')) {
+              this.resetHeartbeatTimer();
+              return;
+            }
+
+            try {
+              const event = JSON.parse(e.data.replace(/^data: /, ''));
+              this.routeEvent(event);
+            } catch (err) {
+              console.error('Failed to parse SSE event:', err, e.data);
+            }
+          };
+
+          this.eventSource.onerror = (err) => {
+            console.error('SSE error:', err);
+            this.handleDisconnect();
+          };
+
+          this.eventSource.onopen = () => {
+            console.log('SSE connected');
+            this.reconnectAttempts = 0;
+            this.updateConnectionStatus(true);
+            this.resetHeartbeatTimer();
+          };
+
+        } catch (error) {
+          console.error('Failed to create EventSource:', error);
+          this.handleDisconnect();
+        }
+      }
+
+      routeEvent(event) {
+        console.log('SSE event:', event);
+
+        const handlers = {
+          'chat_message': (e) => ChatManager.handleSSEMessage(e),
+          'board_update': (e) => BoardManager.handleBoardUpdate(e),
+          'job_started': (e) => this.handleJobEvent(e, 'started'),
+          'job_succeeded': (e) => this.handleJobEvent(e, 'success'),
+          'job_failed': (e) => this.handleJobEvent(e, 'error'),
+          'wip_limit_exceeded': (e) => this.handleWIPLimit(e)
+        };
+
+        const handler = handlers[event.kind];
+        if (handler) {
+          handler(event);
+        } else {
+          console.warn('Unknown event type:', event.kind);
+        }
+      }
+
+      resetHeartbeatTimer() {
+        clearTimeout(this.heartbeatTimeout);
+        this.heartbeatTimeout = setTimeout(() => {
+          console.warn('Heartbeat timeout - connection may be stale');
+          this.handleDisconnect();
+        }, 35000); // 35s timeout (heartbeat is 30s)
+      }
+
+      handleDisconnect() {
+        this.updateConnectionStatus(false);
+        this.eventSource?.close();
+
+        // Exponential backoff reconnect
+        const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+        console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts + 1})`);
+
+        this.reconnectTimeout = setTimeout(() => {
+          this.reconnectAttempts++;
+          this.connect();
+        }, delay);
+      }
+
+      updateConnectionStatus(connected) {
+        AppState.update('connected', connected);
+
+        const status = document.querySelector('.connection-status');
+        if (status) {
+          status.dataset.connected = connected;
+          status.querySelector('.status-label').textContent = connected ? 'Conectado' : 'Desconectado';
+        }
+      }
+
+      handleJobEvent(event, type) {
+        const titles = {
+          'started': 'Job Iniciado',
+          'success': 'Job Concluído',
+          'error': 'Job Falhou'
+        };
+
+        NotificationManager.show(
+          type === 'started' ? 'info' : type,
+          titles[type],
+          event.job_id || 'Job processado'
+        );
+      }
+
+      handleWIPLimit(event) {
+        NotificationManager.show(
+          'warning',
+          'Limite WIP Excedido',
+          'Não é possível adicionar mais cards em progresso'
+        );
+      }
+
+      disconnect() {
+        clearTimeout(this.reconnectTimeout);
+        clearTimeout(this.heartbeatTimeout);
+        this.eventSource?.close();
+      }
+    }
+
+    // ============================================
+    // 8. KEYBOARD NAVIGATION
+    // ============================================
+    const KeyboardNav = {
+      init() {
+        document.addEventListener('keydown', this.handleKeydown.bind(this));
+      },
+
+      handleKeydown(e) {
+        // Escape to close modals/panels
+        if (e.key === 'Escape') {
+          // TODO: Close any open modals
+        }
+
+        // Ctrl/Cmd + K to focus chat input
+        if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+          e.preventDefault();
+          document.querySelector('.chat-input')?.focus();
+        }
+
+        // Arrow keys for card navigation
+        if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
+          this.navigateCards(e);
+        }
+      },
+
+      navigateCards(e) {
+        const focused = document.activeElement;
+        if (!focused.closest('.board-card')) return;
+
+        const card = focused.closest('.board-card');
+        let target;
+
+        switch (e.key) {
+          case 'ArrowDown':
+            target = card.nextElementSibling;
+            if (target?.classList.contains('empty-state')) target = null;
+            break;
+          case 'ArrowUp':
+            target = card.previousElementSibling;
+            if (target?.classList.contains('empty-state')) target = null;
+            break;
+          case 'ArrowRight':
+            const nextColumn = card.closest('.board-column').nextElementSibling;
+            target = nextColumn?.querySelector('.board-card');
+            break;
+          case 'ArrowLeft':
+            const prevColumn = card.closest('.board-column').previousElementSibling;
+            target = prevColumn?.querySelector('.board-card');
+            break;
+        }
+
+        if (target) {
+          e.preventDefault();
+          target.focus();
+        }
+      }
+    };
+
+    // ============================================
+    // 9. AUTOPILOT TOGGLE
+    // ============================================
+    const AutopilotManager = {
+      init() {
+        const toggle = document.querySelector('.toggle-switch');
+        if (toggle) {
+          toggle.addEventListener('click', () => this.toggle());
+          toggle.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              this.toggle();
+            }
+          });
+        }
+      },
+
+      async toggle() {
+        const newState = !AppState.autopilot;
+
+        try {
+          const response = await fetch('/agent/autopilot', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: newState })
+          });
+
+          if (!response.ok) throw new Error('Failed to toggle autopilot');
+
+          AppState.update('autopilot', newState);
+          this.updateUI(newState);
+
+          NotificationManager.show(
+            'success',
+            'Autopilot',
+            newState ? 'Autopilot ativado' : 'Autopilot desativado'
+          );
+
+        } catch (error) {
+          console.error('Failed to toggle autopilot:', error);
+          NotificationManager.show('error', 'Erro', 'Falha ao alterar autopilot');
+        }
+      },
+
+      updateUI(enabled) {
+        const toggle = document.querySelector('.toggle-switch');
+        if (toggle) {
+          toggle.classList.toggle('active', enabled);
+          toggle.setAttribute('aria-checked', enabled);
+        }
+      }
+    };
+
+    // ============================================
+    // 10. METRICS PANEL TOGGLE
+    // ============================================
+    const MetricsManager = {
+      init() {
+        const toggle = document.querySelector('.metrics-toggle');
+        if (toggle) {
+          toggle.addEventListener('click', () => this.togglePanel());
+        }
+      },
+
+      togglePanel() {
+        const panel = document.querySelector('.metrics-panel');
+        const toggle = document.querySelector('.metrics-toggle');
+
+        if (panel.classList.contains('collapsed')) {
+          panel.classList.remove('collapsed');
+          toggle.textContent = '«';
+          toggle.setAttribute('aria-label', 'Recolher painel');
+        } else {
+          panel.classList.add('collapsed');
+          toggle.textContent = '»';
+          toggle.setAttribute('aria-label', 'Expandir painel');
+        }
+      }
+    };
+
+    // ============================================
+    // 11. APPLICATION INITIALIZATION
+    // ============================================
+    const App = {
+      state: AppState,
+      sse: null,
+
+      init() {
+        console.log('Initializing WordFlux Cockpit...');
+        console.log('Session ID:', AppState.session_id);
+
+        // Initialize managers
+        ThemeManager.init();
+        KeyboardNav.init();
+        ChatManager.init();
+        BoardManager.init();
+        AutopilotManager.init();
+        MetricsManager.init();
+
+        // Connect SSE
+        this.sse = new SSEManager();
+        this.sse.connect();
+
+        // Bind theme toggle
+        document.querySelector('.theme-toggle')?.addEventListener('click', () => {
+          ThemeManager.toggle();
+        });
+
+        // Load mock data (for demo)
+        setTimeout(() => {
+          BoardManager.loadMockData();
+        }, 500);
+
+        console.log('WordFlux Cockpit initialized successfully');
+      }
+    };
+
+    // Initialize on DOMContentLoaded
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => App.init());
+    } else {
+      App.init();
+    }
+  </script>
+</body>
+</html>

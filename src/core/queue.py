@@ -141,6 +141,7 @@ class RedisJobQueue(JobQueue):
     def ack_job(self, dequeued: DequeuedJob) -> None:
         """Remove job from processing list after successful completion."""
         if dequeued._processing_key:
+            # Remove the actual payload from processing list
             self._client.lrem(self._processing_key, 1, dequeued._processing_key)
 
     def _decode_job(self, payload: str) -> Job | None:
@@ -168,6 +169,7 @@ class RedisJobQueue(JobQueue):
             payload=payload_data,
             job_id=data.get("job_id") or uuid4().hex,
             enqueued_at=data.get("enqueued_at") or time(),
+            metadata=data.get("metadata", {}),
         )
 
 

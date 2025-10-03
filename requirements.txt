@@ -3,3 +3,15 @@ pydantic>=2.8
 structlog>=24.1
 requests>=2.31
 redis>=5.0
+fastapi>=0.117
+uvicorn>=0.37
+apscheduler>=3.10.4
+openai>=1.52.0
+anthropic>=0.39.0
+boto3>=1.28.0
+
+# Agent dependencies
+aiohttp>=3.9.0           # Async HTTP for link_validator
+beautifulsoup4>=4.12.0   # HTML parsing for content_extractor and seo_analyzer
+lxml>=5.0.0              # Fast HTML/XML parser
+html5lib>=1.1            # HTML5 parser

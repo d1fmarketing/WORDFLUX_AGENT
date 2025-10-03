@@ -4,7 +4,7 @@ PIP ?= $(VENV)/bin/pip
 PYTEST ?= $(VENV)/bin/pytest
 RUFF ?= $(VENV)/bin/ruff
 
-.PHONY: venv install dev lint format test coverage run-agent worker clean
+.PHONY: venv install dev lint format test coverage run-agent worker chat-test chat-smoke clean
 
 venv:
 	@if [ ! -d "$(VENV)" ]; then \
@@ -35,6 +35,12 @@ run-agent: dev
 
 worker: dev
 	$(VENV)/bin/python -m scripts.run_worker --once
+
+chat-test: dev
+	WF_LLM_PROVIDER=mock $(PYTEST) tests/unit/test_llm_bridge.py tests/unit/test_chat_api.py -xvs
+
+chat-smoke: dev
+	WF_LLM_PROVIDER=mock $(VENV)/bin/python scripts/chat_smoke.py
 
 clean:
 	rm -rf $(VENV)

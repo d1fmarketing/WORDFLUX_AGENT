@@ -17,6 +17,7 @@ class Job:
     payload: Payload
     job_id: str = field(default_factory=lambda: uuid4().hex)
     enqueued_at: float = field(default_factory=time)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -24,6 +25,7 @@ class Job:
             "agent": self.agent,
             "payload": self.payload,
             "enqueued_at": self.enqueued_at,
+            "metadata": self.metadata,
         }
 
 

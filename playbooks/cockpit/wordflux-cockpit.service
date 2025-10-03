@@ -1,0 +1,30 @@
+[Unit]
+Description=WordFlux Cockpit - Visual Workflow Management
+After=network.target redis-server.service
+Wants=redis-server.service
+
+[Service]
+Type=exec
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+Environment="PATH=/home/ubuntu/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONPATH=/home/ubuntu"
+EnvironmentFile=/home/ubuntu/wordflux.env
+ExecStart=/home/ubuntu/.venv/bin/python /home/ubuntu/playbooks/cockpit/wordflux_cockpit.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/wordflux-cockpit.log
+StandardError=append:/var/log/wordflux-cockpit.error.log
+
+# Process management
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,567 @@
+openapi: 3.0.0
+info:
+  title: WordFlux Cockpit API
+  description: Visual workflow management system with job queue integration
+  version: 1.0.0
+  contact:
+    name: WordFlux Team
+    email: support@wordflux.io
+
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+  - url: http://localhost
+    description: Production (via nginx)
+
+tags:
+  - name: Health
+    description: System health and status
+  - name: Board
+    description: Board and card management
+  - name: Agent
+    description: Agent actions and automation
+  - name: KPIs
+    description: Key performance indicators
+  - name: AI
+    description: AI-powered features
+  - name: Events
+    description: Real-time event streaming
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check with queue status
+      responses:
+        '200':
+          description: System is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok, error]
+                  ts:
+                    type: integer
+                    description: Unix timestamp
+                  queue_mode:
+                    type: string
+                    enum: [memory, redis]
+                  queue_depth:
+                    type: integer
+                  redis:
+                    type: boolean
+
+  /board/state:
+    get:
+      tags: [Board]
+      summary: Get complete board state
+      responses:
+        '200':
+          description: Board state with all columns and cards
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  columns:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          enum: [Backlog, In Progress, Waiting Approval, Scheduled, Published]
+                        cards:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/Card'
+                  autopilot:
+                    type: boolean
+                    description: Whether autopilot mode is enabled
+
+  /board/card:
+    post:
+      tags: [Board]
+      summary: Create a new card in Backlog
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title:
+                  type: string
+                  maxLength: 140
+                  example: "Write blog post about Redis"
+                intent:
+                  type: string
+                  example: "Educational content for developers"
+                meta:
+                  type: object
+                  properties:
+                    assignee:
+                      type: string
+                    priority:
+                      type: string
+                      enum: [low, normal, high]
+                    platform:
+                      type: string
+      responses:
+        '200':
+          description: Card created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  created:
+                    $ref: '#/components/schemas/Card'
+
+  /board/move:
+    post:
+      tags: [Board]
+      summary: Move a card to a different column
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [card_id, to]
+              properties:
+                card_id:
+                  type: string
+                  example: "c-12345"
+                to:
+                  type: string
+                  enum: [Backlog, In Progress, Waiting Approval, Scheduled, Published]
+      responses:
+        '200':
+          description: Card moved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  moved:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      from:
+                        type: string
+                      to:
+                        type: string
+        '404':
+          description: Card not found
+
+  /agent/suggest:
+    get:
+      tags: [Agent]
+      summary: Get suggested actions for a card
+      parameters:
+        - name: card_id
+          in: query
+          required: true
+          schema:
+            type: string
+          example: "c-12345"
+      responses:
+        '200':
+          description: Available actions for the card
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  card_id:
+                    type: string
+                  column:
+                    type: string
+                  actions:
+                    type: array
+                    items:
+                      type: string
+                      enum: [start_work, send_for_review, approve, request_changes, publish_now, report_kpis]
+
+  /agent/act:
+    post:
+      tags: [Agent]
+      summary: Execute an agent action on a card
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [card_id, action]
+              properties:
+                card_id:
+                  type: string
+                  example: "c-12345"
+                action:
+                  type: string
+                  enum: [start_work, send_for_review, approve, request_changes, publish_now, report_kpis, pause, reschedule]
+      responses:
+        '200':
+          description: Action executed and job queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  to:
+                    type: string
+                    description: New column for the card
+                  job_id:
+                    type: string
+                    description: ID of the queued job
+                    example: "cockpit-a1b2c3d4"
+
+  /agent/autopilot:
+    post:
+      tags: [Agent]
+      summary: Toggle autopilot mode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [on]
+              properties:
+                on:
+                  type: boolean
+      responses:
+        '200':
+          description: Autopilot mode updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  autopilot:
+                    type: boolean
+
+  /kpis/completed:
+    get:
+      tags: [KPIs]
+      summary: Get completed tasks for the last N days
+      parameters:
+        - name: days
+          in: query
+          schema:
+            type: integer
+            default: 7
+            minimum: 1
+            maximum: 90
+      responses:
+        '200':
+          description: Completed tasks breakdown
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:
+                    type: integer
+                  by_user:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                  by_day:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                  period_days:
+                    type: integer
+
+  /kpis/efficiency:
+    get:
+      tags: [KPIs]
+      summary: Calculate efficiency metrics
+      responses:
+        '200':
+          description: Efficiency metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  overall:
+                    type: number
+                    format: float
+                    description: Overall efficiency percentage
+                  by_user:
+                    type: object
+                  cards_by_state:
+                    type: object
+                    additionalProperties:
+                      type: integer
+
+  /kpis/daily_plan:
+    get:
+      tags: [KPIs]
+      summary: Get today's planned tasks
+      parameters:
+        - name: user
+          in: query
+          schema:
+            type: string
+          description: Filter by specific user
+      responses:
+        '200':
+          description: Daily task plan
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  date:
+                    type: string
+                    format: date
+                  total:
+                    type: integer
+                  tasks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        title:
+                          type: string
+                        scheduled_time:
+                          type: string
+                          format: date-time
+                        assignee:
+                          type: string
+                        priority:
+                          type: string
+
+  /ai/plan_tomorrow:
+    post:
+      tags: [AI]
+      summary: Plan tomorrow's tasks using AI
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                user:
+                  type: string
+                  default: "all"
+      responses:
+        '200':
+          description: Planning job queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  job_id:
+                    type: string
+                  message:
+                    type: string
+
+  /me/tasks:
+    get:
+      tags: [Board]
+      summary: Get tasks for the current user
+      parameters:
+        - name: scope
+          in: query
+          schema:
+            type: string
+            enum: [mine, all]
+            default: mine
+        - name: when
+          in: query
+          schema:
+            type: string
+            enum: [today, tomorrow, week]
+            default: today
+      responses:
+        '200':
+          description: User's tasks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scope:
+                    type: string
+                  when:
+                    type: string
+                  user:
+                    type: string
+                  total:
+                    type: integer
+                  tasks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Task'
+
+  /cards/cleanup:
+    post:
+      tags: [Board]
+      summary: Clean up old cards
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                state:
+                  type: string
+                  default: Published
+                days_old:
+                  type: integer
+                  default: 7
+      responses:
+        '200':
+          description: Cleanup completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  state:
+                    type: string
+                  removed:
+                    type: integer
+                  message:
+                    type: string
+
+  /queue/status:
+    get:
+      tags: [Health]
+      summary: Get queue statistics
+      responses:
+        '200':
+          description: Queue status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mode:
+                    type: string
+                    enum: [memory, redis]
+                  depth:
+                    type: integer
+
+  /events/recent:
+    get:
+      tags: [Events]
+      summary: Get recent events
+      responses:
+        '200':
+          description: List of recent events
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Event'
+
+  /events/stream:
+    get:
+      tags: [Events]
+      summary: Server-sent events stream
+      description: Real-time event stream using Server-Sent Events (SSE)
+      responses:
+        '200':
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                example: |
+                  data: {"kind":"board_update","card":{"id":"c-12345","title":"Test"},"ts":1234567890}
+
+                  data: {"kind":"agent_action","action":"start_work","job_id":"job-123"}
+
+components:
+  schemas:
+    Card:
+      type: object
+      properties:
+        id:
+          type: string
+          example: "c-12345"
+        title:
+          type: string
+          example: "Write blog post"
+        intent:
+          type: string
+        status:
+          type: string
+          enum: [Backlog, In Progress, Waiting Approval, Scheduled, Published]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        last_job_id:
+          type: string
+          description: ID of the last job executed for this card
+        last_action:
+          type: string
+          description: Last action performed on this card
+        meta:
+          type: object
+          properties:
+            assignee:
+              type: string
+            priority:
+              type: string
+              enum: [low, normal, high]
+            platform:
+              type: string
+            scheduled_time:
+              type: string
+              format: date-time
+
+    Task:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        status:
+          type: string
+        assignee:
+          type: string
+        priority:
+          type: string
+
+    Event:
+      type: object
+      properties:
+        ts:
+          type: integer
+          description: Unix timestamp in milliseconds
+        kind:
+          type: string
+          enum: [board_update, agent_action, job_queued, kpi_report]
+        card:
+          $ref: '#/components/schemas/Card'
+        action:
+          type: string
+        job_id:
+          type: string
