@@ -31,7 +31,70 @@ from typing import Any, Dict, Optional
 # Adicionar cockpit ao path para importar helpers
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'playbooks', 'cockpit'))
 
+# Import optimistic update metrics
+from src.core.metrics_optimistic import record_card_operation_completed
+
 logger = logging.getLogger(__name__)
+
+
+# ============================================
+# Custom Exceptions with PT-BR error codes
+# ============================================
+
+class BoardOperatorError(Exception):
+    """Base exception for board operator errors with structured error info."""
+
+    def __init__(self, message: str, code: str, hint: str):
+        """
+        Args:
+            message: Error message (technical)
+            code: Error code (e.g., "wip_limit", "card_not_found")
+            hint: User-friendly hint in PT-BR
+        """
+        super().__init__(message)
+        self.code = code
+        self.hint = hint
+
+    def to_dict(self) -> Dict[str, str]:
+        """Convert to dict for logging/events."""
+        return {
+            "message": str(self),
+            "code": self.code,
+            "hint": self.hint
+        }
+
+
+class WIPLimitError(BoardOperatorError):
+    """WIP limit exceeded."""
+
+    def __init__(self, column: str, current: int, limit: int):
+        super().__init__(
+            message=f"WIP limit exceeded in column '{column}': {current}/{limit}",
+            code="wip_limit",
+            hint=f"Limite WIP atingido em '{column}'. Remova outros cards dessa coluna primeiro."
+        )
+
+
+class CardNotFoundError(BoardOperatorError):
+    """Card not found by ID or title."""
+
+    def __init__(self, card_ref: str):
+        super().__init__(
+            message=f"Card not found: '{card_ref}'",
+            code="card_not_found",
+            hint=f"Card '{card_ref}' não encontrado. Verifique o ID ou título."
+        )
+
+
+class InvalidColumnError(BoardOperatorError):
+    """Invalid/unknown column name."""
+
+    def __init__(self, column: str):
+        super().__init__(
+            message=f"Invalid column: '{column}'",
+            code="invalid_column",
+            hint=f"Coluna '{column}' inválida. Use: Espera, Produção, Aprovação, Agendado, Finalizado."
+        )
 
 
 class BoardOperatorAgent:
@@ -129,9 +192,33 @@ class BoardOperatorAgent:
             },
         }
 
-        # Criar card no board
-        if not push_to(column, card):
-            raise RuntimeError(f"Falha ao criar card na coluna '{column}' (WIP limit?)")
+        # Criar card no board (push_to já valida coluna e incrementa métricas)
+        try:
+            success = push_to(column, card)
+        except ValueError as e:
+            # Coluna inválida - métrica já incrementada em push_to()
+            logger.error(
+                f"❌ create_card falhou: coluna inválida '{column}'",
+                extra={"operation": "create_card", "column": column, "title": title}
+            )
+            raise InvalidColumnError(column) from e
+
+        if not success:
+            # WIP limit excedido - métrica já incrementada em push_to()
+            # Get current count for error message
+            from wordflux_cockpit import rclient, get_column_key
+            r = rclient()
+            current_count = r.llen(get_column_key(column))
+
+            # Record failed operation (WIP limit)
+            record_card_operation_completed(
+                operation='create',
+                list_name=column,
+                success=False,
+                error_code='wip_limit'
+            )
+
+            raise WIPLimitError(column=column, current=current_count, limit=2)  # TODO: get actual limit
 
         # Emitir evento SSE tipado
         from src.core.events import emit_card_created
@@ -140,6 +227,13 @@ class BoardOperatorAgent:
             title=card["title"],
             list_name=column,
             meta=card.get("meta")
+        )
+
+        # Record successful operation
+        record_card_operation_completed(
+            operation='create',
+            list_name=column,
+            success=True
         )
 
         logger.info(f"✅ Card criado: {card['id']} → {column} (título: {title})")
@@ -175,19 +269,40 @@ class BoardOperatorAgent:
             card, from_column = self._find_card_by_title_fuzzy(card_ref)
 
         if not card:
-            raise ValueError(f"Card não encontrado: '{card_ref}'")
+            raise CardNotFoundError(card_ref=card_ref)
 
         card_id = card["id"]
         original_column = from_column
 
-        # Tentar mover para coluna destino
-        if not push_to(to_column, card):
+        # Tentar mover para coluna destino (push_to já valida coluna e incrementa métricas)
+        try:
+            success = push_to(to_column, card)
+        except ValueError as e:
+            # Coluna inválida - reverter card para coluna original
+            push_to(original_column, card, bypass_wip=True)
+            logger.error(
+                f"❌ move_card falhou: coluna inválida '{to_column}'",
+                extra={"operation": "move_card", "card_id": card_id, "to_column": to_column}
+            )
+            raise InvalidColumnError(to_column) from e
+
+        if not success:
             # WIP limit excedido - reverter
             push_to(original_column, card, bypass_wip=True)
-            raise RuntimeError(
-                f"WIP limit excedido na coluna '{to_column}'. "
-                f"Card revertido para '{original_column}'."
+            # Get current count for error message
+            from wordflux_cockpit import rclient, get_column_key
+            r = rclient()
+            current_count = r.llen(get_column_key(to_column))
+
+            # Record failed operation (WIP limit)
+            record_card_operation_completed(
+                operation='move',
+                list_name=to_column,
+                success=False,
+                error_code='wip_limit'
             )
+
+            raise WIPLimitError(column=to_column, current=current_count, limit=2)  # TODO: get actual limit
 
         # Emitir evento SSE tipado
         from src.core.events import emit_card_moved
@@ -197,6 +312,13 @@ class BoardOperatorAgent:
             from_list=original_column,
             to_list=to_column,
             meta=card.get("meta")
+        )
+
+        # Record successful operation
+        record_card_operation_completed(
+            operation='move',
+            list_name=to_column,
+            success=True
         )
 
         logger.info(f"✅ Card movido: {card_id} ({card.get('title', '')[:30]}...) → {original_column} → {to_column}")
@@ -235,7 +357,7 @@ class BoardOperatorAgent:
             card, column = self._find_card_by_title_fuzzy(card_ref)
 
         if not card:
-            raise ValueError(f"Card não encontrado: '{card_ref}'")
+            raise CardNotFoundError(card_ref=card_ref)
 
         card_id = card["id"]
 
@@ -262,6 +384,13 @@ class BoardOperatorAgent:
             list_name=column,
             fields_updated=list(fields.keys()),
             meta=card.get("meta")
+        )
+
+        # Record successful operation
+        record_card_operation_completed(
+            operation='update',
+            list_name=column,
+            success=True
         )
 
         logger.info(f"✅ Card atualizado: {card_id} (campos: {', '.join(fields.keys())})")
@@ -293,7 +422,7 @@ class BoardOperatorAgent:
             card, column = self._find_card_by_title_fuzzy(card_ref)
 
         if not card:
-            raise ValueError(f"Card não encontrado: '{card_ref}'")
+            raise CardNotFoundError(card_ref=card_ref)
 
         card_id = card["id"]
 

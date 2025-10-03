@@ -1,0 +1,269 @@
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                    WORDFLUX DRY HANDLER ARCHITECTURE                          ║
+║                  Agent → Queue → SSE → Board Flow Diagram                     ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                              LAYER 1: CHAT API                                │
+│                                                                               │
+│  User Input                                                                   │
+│      │                                                                        │
+│      ▼                                                                        │
+│  ┌────────────────┐                                                          │
+│  │  Chat Endpoint │  POST /chat/                                             │
+│  │  (FastAPI)     │  {"message": "mova c-123 para Aprovação"}                │
+│  └───────┬────────┘                                                           │
+│          │                                                                    │
+│          ▼                                                                    │
+│  ┌────────────────┐                                                          │
+│  │   LLM Client   │  Bedrock/Anthropic Claude                                │
+│  │   (Tool Use)   │  → Returns: Tool Call {"name": "move_card", ...}         │
+│  └───────┬────────┘                                                           │
+│          │                                                                    │
+│          ▼                                                                    │
+│  ┌────────────────┐                                                          │
+│  │   Validation   │  validate_tool_call()                                    │
+│  │   (Pydantic)   │  → Checks enum values, required fields, etc.            │
+│  └───────┬────────┘                                                           │
+│          │                                                                    │
+│          ▼                                                                    │
+│  ┌───────────────────────────────────────────────────────────────┐           │
+│  │  execute_tool_call() - DRY HANDLER                            │           │
+│  │  ─────────────────────────────────────────────────────────    │           │
+│  │  ✅ Creates Job object (agent="board_operator")               │           │
+│  │  ✅ queue.publish(job) → Redis RPUSH wf:jobs                  │           │
+│  │  ✅ emit_sse_event("job_queued") → Redis PUBLISH wf:events    │           │
+│  │  ✅ Returns job_id                                             │           │
+│  │                                                                │           │
+│  │  ❌ NEVER calls HTTP board APIs                               │           │
+│  │  ❌ NEVER manipulates Redis lists directly                    │           │
+│  │  ❌ NEVER blocks waiting for result                           │           │
+│  └───────┬───────────────────────────────────────────────────────┘           │
+│          │                                                                    │
+│          │ Job ID returned to user                                           │
+│          ▼                                                                    │
+│  Response: {"message": "✅ Confirmado! Job ID: chat-abc123"}                  │
+└───────────────────────────────────────────────────────────────────────────────┘
+                              │
+                              │ Redis RPUSH wf:jobs
+                              │ Redis PUBLISH wf:events
+                              ▼
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                            LAYER 2: REDIS QUEUE                               │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐         │
+│  │  Redis Lists                                                    │         │
+│  │  ──────────────────────────────────────────────────────────────│         │
+│  │  wf:jobs → ["job1", "job2", "job3", ...]                       │         │
+│  │                                                                 │         │
+│  │  Job Format:                                                    │         │
+│  │  {                                                              │         │
+│  │    "job_id": "chat-abc123",                                     │         │
+│  │    "agent": "board_operator",                                   │         │
+│  │    "payload": {                                                 │         │
+│  │      "action": "move_card",                                     │         │
+│  │      "card_ref": "c-123",                                       │         │
+│  │      "to_column": "Aprovação",                                  │         │
+│  │      "from_chat": true,                                         │         │
+│  │      "session_id": "sess-xyz"                                   │         │
+│  │    },                                                           │         │
+│  │    "requested_by": "chat",                                      │         │
+│  │    "timestamp": "2025-10-01T12:00:00Z"                          │         │
+│  │  }                                                              │         │
+│  └─────────────────────────────────────────────────────────────────┘         │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐         │
+│  │  Redis Pub/Sub                                                  │         │
+│  │  ──────────────────────────────────────────────────────────────│         │
+│  │  wf:events → {"kind": "job_queued", "job_id": "chat-abc123"}   │         │
+│  └─────────────────────────────────────────────────────────────────┘         │
+└───────────────────────────────────────────────────────────────────────────────┘
+                              │
+                              │ Worker consumes (BLPOP)
+                              ▼
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                            LAYER 3: WORKER/AGENT                              │
+│                                                                               │
+│  ┌────────────────┐                                                          │
+│  │  Worker Loop   │  .venv/bin/python -m src.core.worker --continuous        │
+│  │  (worker.py)   │  → Consumes jobs via Redis BLPOP                          │
+│  └───────┬────────┘                                                           │
+│          │                                                                    │
+│          ▼                                                                    │
+│  ┌────────────────┐                                                          │
+│  │  Job Router    │  Dispatches to agent based on job.agent field            │
+│  │                │  → "board_operator" → BoardOperatorAgent.run()           │
+│  └───────┬────────┘                                                           │
+│          │                                                                    │
+│          ▼                                                                    │
+│  ┌───────────────────────────────────────────────────────────────┐           │
+│  │  BoardOperatorAgent.run(payload)                              │           │
+│  │  ──────────────────────────────────────────────────────────── │           │
+│  │  1. Parse action: "move_card"                                 │           │
+│  │  2. Call: _move_card(payload)                                 │           │
+│  │     ▼                                                          │           │
+│  │     from wordflux_cockpit import find_and_remove, push_to     │           │
+│  │     ▼                                                          │           │
+│  │     card, from_col = find_and_remove("c-123")                 │           │
+│  │     ▼                                                          │           │
+│  │     success = push_to("Aprovação", card)                      │           │
+│  │     ▼                                                          │           │
+│  │     emit_event("board_update", {...})                         │           │
+│  │                                                                │           │
+│  │  ✅ Uses cockpit helpers (Redis-based)                        │           │
+│  │  ✅ Emits SSE event on completion                             │           │
+│  │  ✅ Respects WIP limits                                       │           │
+│  │  ❌ NEVER makes HTTP calls                                    │           │
+│  └───────┬───────────────────────────────────────────────────────┘           │
+│          │                                                                    │
+│          ▼                                                                    │
+│  Result logged to wf:ledger:{job_id}                                         │
+└───────────────────────────────────────────────────────────────────────────────┘
+                              │
+                              │ Redis pub/sub (wf:events)
+                              ▼
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                          LAYER 4: COCKPIT HELPERS                             │
+│                                                                               │
+│  ┌───────────────────────────────────────────────────────────────┐           │
+│  │  push_to(column, card, bypass_wip=False)                      │           │
+│  │  ─────────────────────────────────────────────────────────────│           │
+│  │  1. Check WIP limit: r.llen(column_key) < WF_WIP_LIMIT        │           │
+│  │  2. If OK: r.lpush(column_key, json.dumps(card))              │           │
+│  │  3. Return success/failure                                     │           │
+│  └───────────────────────────────────────────────────────────────┘           │
+│                                                                               │
+│  ┌───────────────────────────────────────────────────────────────┐           │
+│  │  find_and_remove(card_ref)                                     │           │
+│  │  ─────────────────────────────────────────────────────────────│           │
+│  │  1. For each column in PORTUGUESE_COLUMNS:                     │           │
+│  │     items = r.lrange(column_key, 0, -1)                        │           │
+│  │  2. Find card matching ID or title                             │           │
+│  │  3. r.lrem(column_key, 1, raw_card)                            │           │
+│  │  4. Return (card, column)                                       │           │
+│  └───────────────────────────────────────────────────────────────┘           │
+│                                                                               │
+│  ┌───────────────────────────────────────────────────────────────┐           │
+│  │  emit_event(kind, payload)                                     │           │
+│  │  ─────────────────────────────────────────────────────────────│           │
+│  │  1. Create event: {"ts": ..., "kind": kind, **payload}        │           │
+│  │  2. r.publish("wf:events", json.dumps(event))                  │           │
+│  │  3. r.lpush("wf:events:recent", json.dumps(event))             │           │
+│  │  4. r.ltrim("wf:events:recent", 0, 199)  # Keep last 200       │           │
+│  └───────────────────────────────────────────────────────────────┘           │
+│                                                                               │
+│  Redis Data Structures:                                                      │
+│  ────────────────────────────────────────────────────────────────           │
+│  wf:board:Espera       → List of cards (JSON strings)                        │
+│  wf:board:Produção     → List of cards                                       │
+│  wf:board:Aprovação    → List of cards                                       │
+│  wf:board:Finalizado   → List of cards                                       │
+│  wf:events             → Pub/sub channel                                     │
+│  wf:events:recent      → List of recent events (max 200)                     │
+└───────────────────────────────────────────────────────────────────────────────┘
+                              │
+                              │ SSE via Redis pub/sub
+                              ▼
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                         LAYER 5: FRONTEND (SSE)                               │
+│                                                                               │
+│  ┌────────────────────────────────────────────────────────────┐              │
+│  │  EventSource("/events/stream")                             │              │
+│  │  ────────────────────────────────────────────────────────  │              │
+│  │  1. Opens HTTP connection to /events/stream                │              │
+│  │  2. Server subscribes to Redis: SUBSCRIBE wf:events        │              │
+│  │  3. Server streams events: data: {...}\n\n                 │              │
+│  │  4. Client receives real-time updates                      │              │
+│  └───────┬────────────────────────────────────────────────────┘              │
+│          │                                                                    │
+│          ▼                                                                    │
+│  ┌────────────────────────────────────────────────────────────┐              │
+│  │  Event Handler (React)                                     │              │
+│  │  ────────────────────────────────────────────────────────  │              │
+│  │  eventSource.onmessage = (e) => {                          │              │
+│  │    const event = JSON.parse(e.data);                       │              │
+│  │                                                             │              │
+│  │    if (event.kind === "board_update") {                    │              │
+│  │      // Re-fetch board state or apply delta update         │              │
+│  │      fetchBoardState();                                     │              │
+│  │    }                                                        │              │
+│  │                                                             │              │
+│  │    if (event.kind === "job_queued") {                      │              │
+│  │      // Show toast notification                            │              │
+│  │      toast.info(`Job ${event.job_id} queued`);             │              │
+│  │    }                                                        │              │
+│  │  };                                                         │              │
+│  └────────────────────────────────────────────────────────────┘              │
+│                                                                               │
+│  ┌────────────────────────────────────────────────────────────┐              │
+│  │  Board UI (React)                                          │              │
+│  │  ────────────────────────────────────────────────────────  │              │
+│  │  - Renders columns: Espera, Produção, Aprovação, etc.     │              │
+│  │  - Each card is draggable                                  │              │
+│  │  - Updates reactively on SSE events                        │              │
+│  │  - No polling required                                     │              │
+│  └────────────────────────────────────────────────────────────┘              │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+
+KEY PRINCIPLES:
+
+1. SEPARATION OF CONCERNS:
+   - Layer 1 (Chat): Pure request/response, no side effects
+   - Layer 2 (Queue): Durable storage, async processing
+   - Layer 3 (Worker): Actual execution, side effects allowed
+   - Layer 4 (Cockpit): Redis primitives, no HTTP
+   - Layer 5 (Frontend): Read-only, reactive updates
+
+2. ASYNCHRONOUS FLOW:
+   - Chat returns immediately with job_id
+   - Worker processes job in background
+   - Frontend updates via SSE (no polling)
+
+3. NO TIGHT COUPLING:
+   - Chat doesn't know about Redis schema
+   - Chat doesn't depend on board availability
+   - Worker can scale independently
+   - Frontend doesn't poll for changes
+
+4. AUDIT TRAIL:
+   - All jobs logged in wf:ledger:{job_id}
+   - All events stored in wf:events:recent
+   - Full history for debugging
+
+5. FAILURE HANDLING:
+   - Jobs can be retried from queue
+   - WIP limits prevent bottlenecks
+   - Circuit breakers for external APIs
+   - Graceful degradation
+
+═══════════════════════════════════════════════════════════════════════════════
+
+TIMING EXAMPLE:
+
+T+0ms:   User sends "mova c-123 para Aprovação"
+T+150ms: LLM returns tool_call
+T+151ms: Validation passes
+T+152ms: Job queued (RPUSH wf:jobs)
+T+153ms: SSE event emitted (PUBLISH wf:events)
+T+154ms: Chat returns: "✅ Job ID: chat-abc123"
+         ─────────────────────────────────────────────────────
+T+200ms: Worker picks up job (BLPOP wf:jobs)
+T+201ms: board_operator.run() executes
+T+202ms: find_and_remove("c-123") → card found in "Produção"
+T+203ms: push_to("Aprovação", card) → card moved
+T+204ms: emit_event("board_update") → SSE to frontend
+T+205ms: Frontend receives SSE, re-renders board
+         ─────────────────────────────────────────────────────
+         Total user-perceived latency: ~205ms
+
+═══════════════════════════════════════════════════════════════════════════════
+
+VERIFICATION COMMAND:
+
+./test_dry_handlers.sh
+
+Expected output: ✅ ALL CHECKS PASSED (8 checks, 0 violations)
+
+═══════════════════════════════════════════════════════════════════════════════

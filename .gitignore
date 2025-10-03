@@ -66,3 +66,47 @@ docs/_build/
 .cursor-server/
 .codex/
 .config/
+
+# User environment files (SECURITY)
+.bash_history
+.bash_profile
+.bashrc
+.profile
+wordflux.env
+
+# IDE and editor state
+.cursor/
+.aitk/
+.claude.json.backup
+
+# Backup and temporary files
+*.backup
+*.backup-*
+*_original.py
+*.nginx.backup
+*.patch
+
+# Binary artifacts
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# System packages
+.dotnet/
+.npm-packages/
+.npmrc
+snap/
+
+# GitHub tokens (CRITICAL SECURITY)
+.github_token
+*.token
+
+# Working notes and snippets
+*_snippets.txt
+*_visual_reference.txt
+*_page.html
+*_panel.html
+
+# Unknown artifacts
+=*

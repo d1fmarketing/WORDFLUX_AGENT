@@ -8,13 +8,17 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, TypedDict, Literal
 
 from fastapi import APIRouter, Body, HTTPException, Request
 from pydantic import BaseModel, Field, ValidationError, validator, model_validator
 from typing import Literal
 
+from src.core.board_store import (
+    CANONICAL_PT_COLUMNS,
+    get_board_snapshot,
+)
 from src.core.events import emit_chat_message
 
 # Import optimistic update metrics
@@ -39,6 +43,37 @@ router = APIRouter()
 WF_CHAT_TTL_SEC = int(os.getenv("WF_CHAT_TTL_SEC", "86400"))  # 24 hours
 WF_RATELIMIT_PER_MIN = int(os.getenv("WF_RATELIMIT_PER_MIN", "20"))
 WF_TOKEN_INPUT_CAP = int(os.getenv("WF_TOKEN_INPUT_CAP", "8000"))  # Max input tokens
+
+HTTP_CONNECT_TIMEOUT = float(os.getenv("WF_HTTP_CONNECT_TIMEOUT", "0.5"))
+HTTP_READ_TIMEOUT = float(os.getenv("WF_HTTP_READ_TIMEOUT", "5.0"))
+COCKPIT_TIMEOUT: tuple[float, float] = (HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT)
+SUMMARY_HEALTH_THRESHOLD_MS = float(os.getenv("WF_SUMMARY_HEALTH_MS", "300"))
+
+logger.info(
+    "http_timeouts",
+    extra={
+        "connect": HTTP_CONNECT_TIMEOUT,
+        "read": HTTP_READ_TIMEOUT,
+    },
+)
+
+# Canonical Portuguese columns used across the stack
+CANONICAL_PT_COLUMNS: List[str] = [
+    "Espera",
+    "Produção",
+    "Aprovação",
+    "Agendado",
+    "Finalizado",
+]
+
+# Full synonym map (legacy English → canonical Portuguese)
+COLUMN_EN_PT_SYNONYMS: Dict[str, str] = {
+    "Backlog": "Espera",
+    "In Progress": "Produção",
+    "Waiting Approval": "Aprovação",
+    "Scheduled": "Agendado",
+    "Published": "Finalizado",
+}
 
 # Confirmation keywords (Portuguese + English for flexibility)
 # Used for word-boundary matching to avoid false positives
@@ -103,6 +138,67 @@ def check_confirmation_intent(user_message: str) -> str:
             return "negative"
 
     return "unclear"
+
+
+def check_summary_intent(user_message: str) -> bool:
+    """
+    Detect if user's message is requesting a board summary.
+
+    Uses word-boundary regex matching to detect Portuguese summary keywords.
+    Prevents false positives from substring matching.
+
+    Args:
+        user_message: Raw user message
+
+    Returns:
+        True if summary intent detected, False otherwise
+
+    Examples:
+        >>> check_summary_intent("quantos cards temos?")
+        True
+        >>> check_summary_intent("resumo do board")
+        True
+        >>> check_summary_intent("qual o status?")
+        True
+        >>> check_summary_intent("crie um card de resumo")
+        False  # "resumo" is part of card title, not intent
+    """
+    import re
+
+    # Lowercase for case-insensitive matching
+    text = user_message.lower()
+
+    # Exclude card creation/modification commands
+    # If message starts with creation/modification verbs, it's not a summary intent
+    creation_patterns = [
+        r'^\s*(crie|criar|cria|adicione|adicionar|adiciona|mova|mover|move|atualize|atualizar|atualiza)\b'
+    ]
+
+    for pattern in creation_patterns:
+        if re.search(pattern, text):
+            return False  # Exclude creation commands
+
+    # Summary intent patterns (Portuguese + English)
+    # Captures: resumo, quantos, o que temos, para hoje, status, etc.
+    summary_patterns = [
+        r'\bresumo\b',           # resumo do board
+        r'\bquantos?\b',         # quantos cards / quantas tarefas
+        r'\bo que temos\b',      # o que temos no board
+        r'\bpara hoje\b',        # cards para hoje
+        r'\bstatus\b',           # status do board
+        r'\boverview\b',         # overview (English)
+        r'\btotal\b',            # total de cards
+        r'\bvisão geral\b',      # visão geral
+        r'\bsumário\b',          # sumário
+        r'\bpanorama\b'          # panorama
+    ]
+
+    # Check if any pattern matches
+    for pattern in summary_patterns:
+        if re.search(pattern, text):
+            return True
+
+    return False
 
 
 def generate_confirmation_idempotency_key(
@@ -506,6 +602,16 @@ class ChatResponse(BaseModel):
     requires_approval: bool = Field(default=False, description="Whether action requires user approval")
     proposal_id: Optional[str] = Field(default=None, description="ID of proposal if approval required")
     session_id: str = Field(..., description="Session ID")
+
+
+# Tool execution structured result
+class ToolResult(TypedDict, total=False):
+    kind: Literal["job", "summary", "error"]
+    job_id: str
+    action: str
+    args: Dict[str, Any]
+    text: str
+    error: str
 
 
 # ============================================================================
@@ -1082,6 +1188,12 @@ def store_pending_confirmation(session_id: str, tool_call: Dict[str, Any], messa
     try:
         redis_client.setex(key, 600, json.dumps(pending))  # 10 minute TTL
         logger.info(f"📋 Stored pending confirmation for session {session_id}")
+
+        try:
+            from src.core.metrics import record_pending_confirmation
+            record_pending_confirmation()
+        except ImportError:
+            pass
     except Exception as e:
         logger.error(f"Failed to store pending confirmation: {e}")
         raise
@@ -1235,7 +1347,148 @@ def _publish_job_atomic(queue, job: 'Job', events_to_emit: list) -> None:
             emit_func(**kwargs)
 
 
-def execute_tool_call(tool_call: Dict[str, Any], session_id: str) -> Optional[str]:
+class BoardSummaryUnavailable(RuntimeError):
+    """Raised when board summary cannot be generated safely."""
+
+    def __init__(self, reason: str, duration_ms: Optional[float] = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.duration_ms = duration_ms
+
+
+def execute_summarize_board(scope: Optional[str] = None) -> Dict[str, Any]:
+    """Summarize board without performing internal HTTP calls."""
+
+    start = time.perf_counter()
+
+    try:
+        board_state = get_board_snapshot()
+    except Exception as exc:  # pragma: no cover - depends on Redis availability
+        logger.error("Erro ao obter snapshot do board: %s", exc)
+        raise BoardSummaryUnavailable("unavailable") from exc
+
+    duration_ms = (time.perf_counter() - start) * 1000
+    if duration_ms > SUMMARY_HEALTH_THRESHOLD_MS:
+        logger.warning(
+            "📊 Summary health-gate acionado: %.1fms (>%.1fms)",
+            duration_ms,
+            SUMMARY_HEALTH_THRESHOLD_MS,
+        )
+        raise BoardSummaryUnavailable("slow_store", duration_ms)
+
+    columns: Dict[str, List[Dict[str, Any]]] = board_state.get("columns", {})
+
+    totals_por_coluna = {
+        col: len(columns.get(col, []))
+        for col in CANONICAL_PT_COLUMNS
+    }
+    contagem_total = sum(totals_por_coluna.values())
+
+    now = datetime.now(timezone.utc)
+    deadline_threshold = now + timedelta(days=7)
+    prazos_proximos: List[Dict[str, Any]] = []
+
+    for col_name in CANONICAL_PT_COLUMNS:
+        for card in columns.get(col_name, []):
+            due_date_str = (
+                card.get("due_date")
+                or card.get("meta", {}).get("due")
+            )
+            if not due_date_str:
+                continue
+
+            try:
+                due_date = datetime.fromisoformat(due_date_str.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                continue
+
+            if now <= due_date <= deadline_threshold:
+                prazos_proximos.append({
+                    "title": card.get("title", "Sem título"),
+                    "due_date": due_date_str,
+                    "column": col_name,
+                    "card_id": card.get("id"),
+                })
+
+    gargalos: List[str] = []
+    wip_limit = int(os.getenv("WF_WIP_LIMIT", "2"))
+
+    producao_count = totals_por_coluna.get("Produção", 0)
+    if producao_count >= wip_limit:
+        gargalos.append(f"Produção ({producao_count}/{wip_limit} cards - limite WIP)")
+
+    old_card_threshold_days = 7
+    age_threshold = now - timedelta(days=old_card_threshold_days)
+
+    for col_name in CANONICAL_PT_COLUMNS:
+        old_cards = 0
+        for card in columns.get(col_name, []):
+            created_at_str = card.get("created_at")
+            if not created_at_str:
+                continue
+            try:
+                created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                continue
+            if created_at <= age_threshold:
+                old_cards += 1
+        if old_cards > 0:
+            gargalos.append(
+                f"{col_name} ({old_cards} cards >{old_card_threshold_days} dias)"
+            )
+
+    return {
+        "totals_por_coluna": totals_por_coluna,
+        "contagem_total": contagem_total,
+        "prazos_proximos": prazos_proximos,
+        "gargalos": gargalos,
+        "metrics": {"duration_ms": duration_ms},
+    }
+
+
+def format_summary_response(summary: Dict[str, Any]) -> str:
+    """
+    Format summarize_board result as concise PT-BR response.
+
+    Produces one-line overview with totals followed by optional sections.
+
+    Args:
+        summary: Result from execute_summarize_board()
+
+    Returns:
+        Formatted PT-BR string
+
+    Example output:
+        Total: 15 · Espera 5 · Produção 2 · Aprovação 3 · Agendado 2 · Finalizado 3
+        ⏰ 3 cards com prazo próximo (7 dias)
+        ⚠️ Gargalos: Produção (2/2 cards - limite WIP)
+    """
+    totals = summary.get("totals_por_coluna", {})
+    total = summary.get("contagem_total", 0)
+    prazos = summary.get("prazos_proximos", [])
+    gargalos = summary.get("gargalos", [])
+    error = summary.get("error")
+
+    if error:
+        return f"⚠️ {error}"
+
+    header_parts = [f"Total: {total}"]
+    for col in CANONICAL_PT_COLUMNS:
+        header_parts.append(f"{col} {totals.get(col, 0)}")
+    header_line = " · ".join(header_parts)
+
+    lines = [header_line]
+
+    if prazos:
+        lines.append(f"⏰ {len(prazos)} cards com prazo próximo (7 dias)")
+
+    if gargalos:
+        lines.append(f"⚠️ Gargalos: {', '.join(gargalos)}")
+
+    return "\n".join(lines)
+
+
+def execute_tool_call(tool_call: Dict[str, Any], session_id: str) -> ToolResult:
     """
     Execute a confirmed tool call.
 
@@ -1248,8 +1501,6 @@ def execute_tool_call(tool_call: Dict[str, Any], session_id: str) -> Optional[st
     """
     func_name = tool_call["name"]
     func_args = tool_call["input"]
-
-    job_id = None
 
     try:
         # Import queue dependencies once
@@ -1320,6 +1571,13 @@ def execute_tool_call(tool_call: Dict[str, Any], session_id: str) -> Optional[st
             ])
             logger.info(f"📋 Enfileirado create_card (atomic): título='{func_args.get('title', '')}' → job={job_id}")
 
+            return {
+                "kind": "job",
+                "job_id": job_id,
+                "action": "create_card",
+                "args": func_args,
+            }
+
         elif func_name == "move_card":
             # Generate deterministic job_id for idempotency
             job_id = generate_deterministic_job_id(session_id, func_name, func_args)
@@ -1374,6 +1632,13 @@ def execute_tool_call(tool_call: Dict[str, Any], session_id: str) -> Optional[st
             ])
             logger.info(f"📋 Enfileirado move_card (atomic): {func_args.get('card_id', '')} → {func_args.get('to_column', '')} (job={job_id})")
 
+            return {
+                "kind": "job",
+                "job_id": job_id,
+                "action": "move_card",
+                "args": func_args,
+            }
+
         elif func_name == "update_card":
             # Generate deterministic job_id for idempotency
             job_id = generate_deterministic_job_id(session_id, func_name, func_args)
@@ -1423,18 +1688,63 @@ def execute_tool_call(tool_call: Dict[str, Any], session_id: str) -> Optional[st
             # Frontend will wait for card.updated event
             logger.info(f"📋 Enfileirado update_card (atomic): {func_args.get('card_id', '')} (job={job_id})")
 
+            return {
+                "kind": "job",
+                "job_id": job_id,
+                "action": "update_card",
+                "args": func_args,
+            }
+
         elif func_name == "summarize_board":
-            # Resumo do board (não enfileira job, responde inline)
-            # Por ora retornar mensagem placeholder, implementação futura
-            logger.info(f"📊 summarize_board chamado: scope={func_args.get('scope', 'all')}")
-            # Não criar job - será respondido inline pelo LLM
-            return None
+            logger.info(
+                "📊 summarize_board chamado: scope=%s",
+                func_args.get("scope", "all"),
+            )
+
+            summary_scope = func_args.get("scope")
+            try:
+                summary_data = execute_summarize_board(scope=summary_scope)
+                summary_text = format_summary_response(summary_data)
+                summary_generated = True
+            except BoardSummaryUnavailable as exc:
+                fallback_text = "📊 O board está indisponível para resumo agora. Tente novamente em instantes."
+                logger.warning(
+                    "📊 summarize_board degradado (reason=%s, duration=%.1fms)",
+                    exc.reason,
+                    getattr(exc, "duration_ms", -1.0),
+                )
+                try:
+                    from src.core.metrics import record_summary_skipped
+                    record_summary_skipped()
+                except ImportError:
+                    pass
+                summary_text = fallback_text
+                summary_generated = False
+
+            # Registrar auditoria (mesmo sem job)
+            log_to_audit(
+                session_id,
+                "tool_executed",
+                {
+                    "tool_name": func_name,
+                    "job_id": None,
+                    "params": func_args,
+                    "summary_generated": summary_generated,
+                },
+            )
+
+            return {
+                "kind": "summary",
+                "text": summary_text,
+            }
 
         elif func_name == "ingest_email":
             # Ingest email (não enfileira job, retorna proposta inline)
             logger.info(f"📧 ingest_email chamado: {len(func_args.get('raw_text', ''))} caracteres")
-            # Não criar job - será respondido inline pelo LLM
-            return None
+            return {
+                "kind": "error",
+                "error": "📧 Processamento de e-mails ainda não implementado via chat."
+            }
 
         # Log to audit
         log_to_audit(session_id, "tool_executed", {
@@ -1449,9 +1759,11 @@ def execute_tool_call(tool_call: Dict[str, Any], session_id: str) -> Optional[st
 
     except Exception as e:
         logger.error(f"Failed to execute tool call {func_name}: {e}")
-        raise
+        return {
+            "kind": "error",
+            "error": f"Não consegui executar {func_name}: {e}",
+        }
 
-    return job_id
 
 
 def execute_tool_call_with_id(
@@ -1829,13 +2141,45 @@ def get_llm_client():
 # Router endpoints
 @router.post("", response_model=ChatResponse)
 @router.post("/", response_model=ChatResponse)
-async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
+async def chat(request: Request, payload: Dict[str, Any] = Body(...)) -> ChatResponse:
     """
     Main chat endpoint with LLM integration.
 
     Processes user message, invokes LLM with tools, handles tool calls,
     and returns response with optional approval requirements.
     """
+    try:
+        body = ChatRequest(**payload)
+    except ValidationError as exc:
+        missing = []
+        for err in exc.errors():
+            loc = err.get("loc", [])
+            if not loc:
+                continue
+            missing.append(str(loc[-1]))
+
+        if not missing:
+            missing = ["text"]
+
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "erro": "Requisição inválida",
+                "falta": sorted(set(missing)),
+            },
+        )
+
+    request_start = time.perf_counter()
+
+    def _record_chat_latency() -> None:
+        """Record chat latency metric in milliseconds."""
+        try:
+            from src.core.metrics import record_chat_latency_ms
+            latency_ms = (time.perf_counter() - request_start) * 1000
+            record_chat_latency_ms(latency_ms)
+        except ImportError:
+            pass
+
     # Rate limiting
     client_ip = request.client.host if request.client else "unknown"
     if not check_rate_limit(client_ip):
@@ -1894,6 +2238,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
                 save_message_to_history(body.session_id, "user", body.text)
                 save_message_to_history(body.session_id, "assistant", assistant_message)
                 emit_chat_message(role="assistant", text=assistant_message, session_id=body.session_id)
+                _record_chat_latency()
                 return ChatResponse(
                     message=assistant_message,
                     role="assistant",
@@ -1910,12 +2255,15 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
             existing_job_id = check_confirmation_idempotency(body.session_id, tool_call)
             if existing_job_id:
                 # Already confirmed previously (duplicate detected)
-                assistant_message = (
-                    f"ℹ️ Já confirmado anteriormente. Job ID: `{existing_job_id[:12]}`\n\n"
-                    f"Nenhuma ação adicional foi executada (proteção contra duplicação)."
-                )
+                assistant_message = f"ℹ️ Já confirmado antes. Job: {existing_job_id[:12]}"
                 save_message_to_history(body.session_id, "user", body.text)
                 save_message_to_history(body.session_id, "assistant", assistant_message)
+
+                try:
+                    from src.core.metrics import record_confirmation
+                    record_confirmation("duplicate")
+                except ImportError:
+                    pass
 
                 # Emit SSE event for duplicate confirmation
                 emit_sse_event("confirmation_already_executed", {
@@ -1925,6 +2273,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
                 })
                 emit_chat_message(role="assistant", text=assistant_message, session_id=body.session_id)
 
+                _record_chat_latency()
                 return ChatResponse(
                     message=assistant_message,
                     role="assistant",
@@ -1953,6 +2302,12 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
                     save_message_to_history(body.session_id, "user", body.text)
                     save_message_to_history(body.session_id, "assistant", assistant_message)
 
+                    try:
+                        from src.core.metrics import record_confirmation
+                        record_confirmation("duplicate")
+                    except ImportError:
+                        pass
+
                     emit_sse_event("confirmation_already_executed", {
                         "session_id": body.session_id,
                         "job_id": existing_job_id or job_id,
@@ -1960,6 +2315,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
                     })
                     emit_chat_message(role="assistant", text=assistant_message, session_id=body.session_id)
 
+                    _record_chat_latency()
                     return ChatResponse(
                         message=assistant_message,
                         role="assistant",
@@ -1980,6 +2336,12 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
                 save_message_to_history(body.session_id, "user", body.text)
                 save_message_to_history(body.session_id, "assistant", assistant_message)
 
+                try:
+                    from src.core.metrics import record_confirmation
+                    record_confirmation("accepted")
+                except ImportError:
+                    pass
+
                 emit_sse_event("confirmation_accepted", {
                     "session_id": body.session_id,
                     "job_id": job_id,
@@ -1994,6 +2356,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
 
                 emit_chat_message(role="assistant", text=assistant_message, session_id=body.session_id)
 
+                _record_chat_latency()
                 return ChatResponse(
                     message=assistant_message,
                     role="assistant",
@@ -2008,6 +2371,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
                 save_message_to_history(body.session_id, "user", body.text)
                 save_message_to_history(body.session_id, "assistant", error_msg)
                 emit_chat_message(role="assistant", text=error_msg, session_id=body.session_id)
+                _record_chat_latency()
                 return ChatResponse(
                     message=error_msg,
                     role="assistant",
@@ -2021,9 +2385,15 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
         elif intent == "negative":
             delete_pending_confirmation(body.session_id)
 
-            assistant_message = "❌ Ação cancelada. Como posso ajudar?"
+            assistant_message = "Cancelado."
             save_message_to_history(body.session_id, "user", body.text)
             save_message_to_history(body.session_id, "assistant", assistant_message)
+
+            try:
+                from src.core.metrics import record_confirmation
+                record_confirmation("rejected")
+            except ImportError:
+                pass
 
             emit_sse_event("confirmation_rejected", {
                 "session_id": body.session_id,
@@ -2037,6 +2407,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
 
             emit_chat_message(role="assistant", text=assistant_message, session_id=body.session_id)
 
+            _record_chat_latency()
             return ChatResponse(
                 message=assistant_message,
                 role="assistant",
@@ -2046,16 +2417,14 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
                 session_id=body.session_id
             )
 
-        # Ambiguous response - short re-prompt
+        # Ambiguous response - short re-prompt (repeat original)
         else:
-            assistant_message = (
-                "⚠️ Resposta não reconhecida. "
-                "Diga **sim** para confirmar ou **não** para cancelar."
-            )
+            assistant_message = "⚠️ Ação de alto risco. Diga 'sim' para confirmar ou 'não' para cancelar."
             save_message_to_history(body.session_id, "user", body.text)
             save_message_to_history(body.session_id, "assistant", assistant_message)
             emit_chat_message(role="assistant", text=assistant_message, session_id=body.session_id)
 
+            _record_chat_latency()
             return ChatResponse(
                 message=assistant_message,
                 role="assistant",
@@ -2101,8 +2470,88 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
     except ImportError:
         pass
 
+    # ------------------------------------------------------------------
+    # Resumo direto (evita round-trip no LLM e timeouts desnecessários)
+    # ------------------------------------------------------------------
+    summary_intent_detected = check_summary_intent(body.text)
+    if summary_intent_detected:
+        logger.info("📊 Summary intent direto para sessão %s", body.session_id[:12])
+
+        try:
+            summary_data = execute_summarize_board(scope=None)
+            summary_message = format_summary_response(summary_data)
+
+            save_message_to_history(body.session_id, "assistant", summary_message)
+            emit_chat_message(role="assistant", text=summary_message, session_id=body.session_id)
+
+            try:
+                from src.core.metrics import record_chat_request
+                record_chat_request("anthropic", "summary_direct", 0.0)
+            except ImportError:
+                pass
+
+            _record_chat_latency()
+            return ChatResponse(
+                message=summary_message,
+                role="assistant",
+                tool_calls=[],
+                requires_approval=False,
+                proposal_id=None,
+                session_id=body.session_id
+            )
+        except BoardSummaryUnavailable as exc:
+            fallback_message = "📊 O board está indisponível para resumo agora. Tente novamente em instantes."
+
+            save_message_to_history(body.session_id, "assistant", fallback_message)
+            emit_chat_message(role="assistant", text=fallback_message, session_id=body.session_id)
+
+            try:
+                from src.core.metrics import record_chat_request, record_summary_skipped
+                record_chat_request("anthropic", "summary_failed", 0.0)
+                record_summary_skipped()
+            except ImportError:
+                pass
+
+            logger.warning(
+                "📊 Resumo direto degradado (reason=%s, duration=%.1fms)",
+                exc.reason,
+                getattr(exc, "duration_ms", -1.0),
+            )
+
+            _record_chat_latency()
+            return ChatResponse(
+                message=fallback_message,
+                role="assistant",
+                tool_calls=[],
+                requires_approval=False,
+                proposal_id=None,
+                session_id=body.session_id
+            )
+        except Exception as exc:  # pragma: no cover - unexpected edge cases
+            logger.error("⚠️ Falha ao gerar resumo direto: %s", exc)
+            fallback_message = "📊 O board está indisponível para resumo agora. Tente novamente em instantes."
+
+            save_message_to_history(body.session_id, "assistant", fallback_message)
+            emit_chat_message(role="assistant", text=fallback_message, session_id=body.session_id)
+
+            try:
+                from src.core.metrics import record_chat_request, record_summary_skipped
+                record_chat_request("anthropic", "summary_failed", 0.0)
+                record_summary_skipped()
+            except ImportError:
+                pass
+
+            _record_chat_latency()
+            return ChatResponse(
+                message=fallback_message,
+                role="assistant",
+                tool_calls=[],
+                requires_approval=False,
+                proposal_id=None,
+                session_id=body.session_id
+            )
+
     # Call LLM with timing and 20s timeout
-    import time
     start_time = time.time()
     try:
         # Get system prompt (A/B tested) - only for first message
@@ -2112,6 +2561,8 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
             llm_messages = [{"role": "system", "content": system_prompt_content}] + history
         else:
             llm_messages = history
+
+        summary_intent_detected = False  # já tratado acima
 
         # Wrap LLM call with 20s timeout
         try:
@@ -2145,6 +2596,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
             except ImportError:
                 pass
 
+            _record_chat_latency()
             return ChatResponse(
                 message=fallback_message,
                 role="assistant",
@@ -2180,7 +2632,21 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
             "error_type": "llm_api_error",
             "message": f"Erro ao processar mensagem: {str(e)}"
         })
-        raise HTTPException(status_code=500, detail="Erro ao processar mensagem")
+
+        fallback_message = "Não consegui processar agora. Já registrei e vou tentar novamente."
+
+        save_message_to_history(body.session_id, "assistant", fallback_message)
+        emit_chat_message(role="assistant", text=fallback_message, session_id=body.session_id)
+
+        _record_chat_latency()
+        return ChatResponse(
+            message=fallback_message,
+            role="assistant",
+            tool_calls=[],
+            requires_approval=False,
+            proposal_id=None,
+            session_id=body.session_id
+        )
 
     # Process response (Anthropic format)
     assistant_message = llm_response.get("text", "")
@@ -2227,6 +2693,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
 
                 emit_chat_message(role="assistant", text=assistant_message, session_id=body.session_id)
 
+                _record_chat_latency()
                 return ChatResponse(
                     message=assistant_message,
                     role="assistant",
@@ -2244,7 +2711,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
                 # Build confirmation message in Portuguese (standard format)
                 confirmation_message = (
                     f"{assistant_message}\n\n"
-                    "⚠️ Ação de alto risco. Diga **sim** para confirmar ou **não** para cancelar."
+                    "⚠️ Ação de alto risco. Diga 'sim' para confirmar ou 'não' para cancelar."
                 )
 
                 # Store pending confirmation
@@ -2279,17 +2746,39 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
 
         # If not high risk, execute tool calls immediately (LOW RISK path)
         if not requires_approval:
-            executed_job_ids = []
+            executed_results: List[ToolResult] = []
+            summary_chunks: List[str] = []
+            error_chunks: List[str] = []
 
             for tool_call in tool_calls:
                 func_name = tool_call["name"]
 
                 # Execute tool call imediatamente (enfileira job + emite SSE)
                 try:
-                    job_id = execute_tool_call(tool_call, body.session_id)
-                    if job_id:
-                        executed_job_ids.append(job_id)
-                        logger.info(f"✅ Low-risk tool executed: {func_name} → job={job_id}")
+                    tool_result = execute_tool_call(tool_call, body.session_id)
+
+                    executed_results.append(tool_result)
+                    kind = tool_result.get("kind")
+
+                    if kind == "summary" and "text" in tool_result:
+                        summary_chunks.append(tool_result["text"])
+                        logger.info(
+                            "📊 summarize_board inline concluído para sessão %s",
+                            body.session_id[:12]
+                        )
+                    elif kind == "job" and "job_id" in tool_result:
+                        logger.info(
+                            "✅ Low-risk tool executed: %s → job=%s",
+                            func_name,
+                            tool_result.get("job_id", "?"),
+                        )
+                    elif kind == "error" and "error" in tool_result:
+                        error_chunks.append(tool_result["error"])
+                        logger.warning(
+                            "⚠️ Ferramenta %s retornou erro inline: %s",
+                            func_name,
+                            tool_result["error"],
+                        )
                 except Exception as e:
                     logger.error(f"❌ Failed to execute {func_name}: {e}")
                     # Continue executando outras tools (não falha toda a requisição)
@@ -2301,10 +2790,31 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
                 except ImportError:
                     pass
 
-            # Enriquecer resposta do assistente com job IDs (para clareza)
-            if executed_job_ids:
-                job_ids_str = ", ".join([f"`{jid}`" for jid in executed_job_ids])
-                assistant_message += f"\n\n✅ Job(s) enfileirado(s): {job_ids_str}"
+            # Anexar resumos gerados inline (se houver)
+            if summary_chunks:
+                summary_text = "\n\n".join(summary_chunks)
+                assistant_message = (
+                    f"{assistant_message}\n\n{summary_text}"
+                    if assistant_message
+                    else summary_text
+                )
+
+            if error_chunks:
+                error_text = "\n".join(f"⚠️ {msg}" for msg in error_chunks)
+                assistant_message = (
+                    f"{assistant_message}\n\n{error_text}"
+                    if assistant_message
+                    else error_text
+                )
+
+            job_ids = [res.get("job_id") for res in executed_results if res.get("kind") == "job" and res.get("job_id")]
+            if job_ids:
+                job_ids_str = ", ".join(f"`{jid}`" for jid in job_ids)
+                assistant_message = (
+                    f"{assistant_message}\n\n✅ Job(s) enfileirado(s): {job_ids_str}"
+                    if assistant_message
+                    else f"✅ Job(s) enfileirado(s): {job_ids_str}"
+                )
 
     # Save assistant message to history
     save_message_to_history(body.session_id, "assistant", assistant_message, tool_calls if tool_calls else None)
@@ -2319,6 +2829,7 @@ async def chat(request: Request, body: ChatRequest = Body(...)) -> ChatResponse:
     # Emit assistant chat message event
     emit_chat_message(role="assistant", text=assistant_message, session_id=body.session_id)
 
+    _record_chat_latency()
     return ChatResponse(
         message=assistant_message,
         role="assistant",

@@ -27,6 +27,19 @@ from typing import Any, Dict, List, Optional, Literal
 
 import redis
 
+# Import optimistic update metrics (lazy import to avoid circular dependency)
+try:
+    from src.core.metrics_optimistic import record_sse_emission, record_sse_emission_failure
+    SSE_METRICS_AVAILABLE = True
+except ImportError:
+    SSE_METRICS_AVAILABLE = False
+
+try:
+    from src.core.metrics import record_sse_event
+    SSE_BASE_METRICS_AVAILABLE = True
+except ImportError:  # pragma: no cover - metrics optional in tests
+    SSE_BASE_METRICS_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # Configuration
@@ -122,6 +135,8 @@ class JobFailedEvent(BaseEvent):
         error: Error message describing the failure
         kind: Event type (always "job_failed")
         card_id: Associated card ID (optional)
+        code: Error code (e.g., "wip_limit", "card_not_found") (optional)
+        hint: User-friendly hint in PT-BR (optional)
         ts: Unix timestamp in milliseconds
     """
     job_id: str
@@ -129,6 +144,8 @@ class JobFailedEvent(BaseEvent):
     error: str
     kind: str = field(default="job_failed", init=False)
     card_id: Optional[str] = None
+    code: Optional[str] = None
+    hint: Optional[str] = None
     ts: int = field(default_factory=lambda: int(time.time() * 1000))
 
 
@@ -250,6 +267,48 @@ class PendingConfirmationEvent(BaseEvent):
     ts: int = field(default_factory=lambda: int(time.time() * 1000))
 
 
+@dataclass
+class JobQueuedEvent(BaseEvent):
+    """Job enfileirado na fila de execução (optimistic update).
+
+    Attributes:
+        job_id: Unique job identifier (deterministic SHA1)
+        action: Agent/action name
+        args: Tool arguments for the action
+        kind: Event type (always "job.queued")
+        session_id: Chat session ID (optional)
+        ts: Unix timestamp in milliseconds
+    """
+    job_id: str
+    action: str
+    args: Dict[str, Any]
+    kind: str = field(default="job.queued", init=False)
+    session_id: Optional[str] = None
+    ts: int = field(default_factory=lambda: int(time.time() * 1000))
+
+
+@dataclass
+class CardPendingEvent(BaseEvent):
+    """Card pendente (UI otimista) antes de confirmação do worker.
+
+    Attributes:
+        temp_id: Temporary card ID (same as job_id for reconciliation)
+        title: Card title
+        list: Target column name
+        kind: Event type (always "card.pending")
+        meta: Card metadata (optional)
+        session_id: Chat session ID (optional)
+        ts: Unix timestamp in milliseconds
+    """
+    temp_id: str
+    title: str
+    list: str
+    kind: str = field(default="card.pending", init=False)
+    meta: Optional[Dict[str, Any]] = None
+    session_id: Optional[str] = None
+    ts: int = field(default_factory=lambda: int(time.time() * 1000))
+
+
 # ============================================
 # SSE Emitter
 # ============================================
@@ -310,7 +369,7 @@ class SSEEmitter:
                 return None
         return self._redis_client
 
-    def emit(self, event: BaseEvent) -> bool:
+    def emit(self, event: BaseEvent, pipe=None) -> bool:
         """Emit an event to Redis pub/sub and history list.
 
         The event is:
@@ -320,9 +379,23 @@ class SSEEmitter:
 
         Args:
             event: Event instance to emit
+            pipe: Optional Redis pipeline for atomic operations.
+                  If provided, commands are added to pipe (caller must execute).
+                  If None, creates own pipeline and executes immediately.
 
         Returns:
-            True if emission succeeded, False otherwise
+            True if emission succeeded (or added to pipeline), False otherwise
+
+        Examples:
+            >>> # Standalone emission (current behavior)
+            >>> emitter.emit(event)
+
+            >>> # Atomic emission with other operations
+            >>> pipe = redis_client.pipeline()
+            >>> pipe.rpush('queue', job_json)
+            >>> emitter.emit(event1, pipe=pipe)
+            >>> emitter.emit(event2, pipe=pipe)
+            >>> pipe.execute()  # All or nothing
         """
         r = self._get_redis()
         if not r:
@@ -333,16 +406,42 @@ class SSEEmitter:
             event_dict = event.to_dict()
             raw = json.dumps(event_dict, default=str)
 
-            pipe = r.pipeline()
+            # Use provided pipeline or create own
+            own_pipe = pipe is None
+            if own_pipe:
+                pipe = r.pipeline()
+
             pipe.publish(self.channel, raw)
             pipe.lpush(self.list_key, raw)
             pipe.ltrim(self.list_key, 0, self.history_size - 1)
-            pipe.execute()
+
+            # If we created the pipeline, execute it now
+            if own_pipe:
+                pipe.execute()
+
+            # Record successful SSE emission
+            if SSE_METRICS_AVAILABLE:
+                pipeline_mode = 'standalone' if own_pipe else 'atomic'
+                record_sse_emission(
+                    event_kind=event.kind,
+                    pipeline_mode=pipeline_mode
+                )
+
+            if SSE_BASE_METRICS_AVAILABLE:
+                record_sse_event(event.kind)
 
             logger.debug(f"Emitted SSE event: {event.kind} ({len(raw)} bytes)")
             return True
 
         except Exception as e:
+            # Record SSE emission failure
+            if SSE_METRICS_AVAILABLE:
+                error_type = e.__class__.__name__
+                record_sse_emission_failure(
+                    event_kind=event.kind,
+                    error_type=error_type
+                )
+
             logger.error(f"Failed to emit SSE event {event.kind}: {e}")
             return False
 
@@ -377,6 +476,9 @@ class SSEEmitter:
             pipe.lpush(self.list_key, raw)
             pipe.ltrim(self.list_key, 0, self.history_size - 1)
             pipe.execute()
+
+            if SSE_BASE_METRICS_AVAILABLE:
+                record_sse_event(kind)
 
             logger.debug(f"Emitted raw SSE event: {kind} ({len(raw)} bytes)")
             return True
@@ -498,7 +600,9 @@ def emit_job_failed(
     job_id: str,
     action: str,
     error: str,
-    card_id: Optional[str] = None
+    card_id: Optional[str] = None,
+    code: Optional[str] = None,
+    hint: Optional[str] = None
 ) -> bool:
     """Emit a job failed event.
 
@@ -507,11 +611,13 @@ def emit_job_failed(
         action: Agent name that failed
         error: Error message describing the failure
         card_id: Associated card ID (optional)
+        code: Error code (e.g., "wip_limit", "card_not_found") (optional)
+        hint: User-friendly hint in PT-BR (optional)
 
     Returns:
         True if emission succeeded, False otherwise
     """
-    event = JobFailedEvent(job_id=job_id, action=action, error=error, card_id=card_id)
+    event = JobFailedEvent(job_id=job_id, action=action, error=error, card_id=card_id, code=code, hint=hint)
     return get_default_emitter().emit(event)
 
 
@@ -657,6 +763,74 @@ def emit_pending_confirmation(
     """
     event = PendingConfirmationEvent(token=token, summary=summary, session_id=session_id)
     return get_default_emitter().emit(event)
+
+
+def emit_job_queued(
+    job_id: str,
+    action: str,
+    args: Dict[str, Any],
+    session_id: Optional[str] = None,
+    pipe=None
+) -> bool:
+    """Emit a job queued event (optimistic update).
+
+    Args:
+        job_id: Unique deterministic job identifier
+        action: Agent/action name (e.g., "create_card")
+        args: Tool arguments for the action
+        session_id: Chat session ID (optional)
+        pipe: Optional Redis pipeline for atomic operations
+
+    Returns:
+        True if emission succeeded, False otherwise
+
+    Examples:
+        >>> emit_job_queued("job-abc123", "create_card", {"title": "Test"}, "sess-456")
+        True
+
+        >>> # Atomic with queue publish
+        >>> pipe = redis_client.pipeline()
+        >>> pipe.rpush('queue', job_json)
+        >>> emit_job_queued("job-123", "create_card", {}, pipe=pipe)
+        >>> pipe.execute()
+    """
+    event = JobQueuedEvent(job_id=job_id, action=action, args=args, session_id=session_id)
+    return get_default_emitter().emit(event, pipe=pipe)
+
+
+def emit_card_pending(
+    temp_id: str,
+    title: str,
+    list_name: str,
+    meta: Optional[Dict[str, Any]] = None,
+    session_id: Optional[str] = None,
+    pipe=None
+) -> bool:
+    """Emit a card pending event (optimistic UI update).
+
+    Args:
+        temp_id: Temporary card ID (same as job_id for reconciliation)
+        title: Card title
+        list_name: Target column name
+        meta: Card metadata (optional)
+        session_id: Chat session ID (optional)
+        pipe: Optional Redis pipeline for atomic operations
+
+    Returns:
+        True if emission succeeded, False otherwise
+
+    Examples:
+        >>> emit_card_pending("temp-abc", "Deploy feature X", "Produção", session_id="sess-123")
+        True
+
+        >>> # Atomic with queue publish
+        >>> pipe = redis_client.pipeline()
+        >>> pipe.rpush('queue', job_json)
+        >>> emit_card_pending("job-123", "Card Title", "Espera", pipe=pipe)
+        >>> pipe.execute()
+    """
+    event = CardPendingEvent(temp_id=temp_id, title=title, list=list_name, meta=meta, session_id=session_id)
+    return get_default_emitter().emit(event, pipe=pipe)
 
 
 # ============================================

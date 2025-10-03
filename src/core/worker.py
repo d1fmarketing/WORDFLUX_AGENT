@@ -43,7 +43,8 @@ try:
         record_worker_error,
         start_metrics_server,
         update_queue_metrics,
-        get_redis_queue_metrics
+        get_redis_queue_metrics,
+        record_job_latency_ms,
     )
     METRICS_ENABLED = True
 except ImportError:
@@ -185,6 +186,9 @@ class Worker:
                     latency_seconds=reconciliation_latency
                 )
 
+                if action:
+                    record_job_latency_ms(action, reconciliation_latency * 1000)
+
                 # Record pending card age and decrement gauge (for create_card and move_card)
                 # P0 fix: Only decrement for chat-originated jobs (matches increment logic)
                 if action in ('create_card', 'move_card') and from_chat:
@@ -244,6 +248,9 @@ class Worker:
                     outcome='failed',
                     latency_seconds=reconciliation_latency
                 )
+
+                if action:
+                    record_job_latency_ms(action, reconciliation_latency * 1000)
 
                 # Decrement pending cards gauge (failed reconciliation still resolves pending state)
                 # P0 fix: Only decrement for chat-originated jobs (matches increment logic)

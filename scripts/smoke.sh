@@ -26,7 +26,12 @@ set -euo pipefail
 # Configuration
 ################################################################################
 BASE_URL="${1:-http://localhost:8080}"
-COCKPIT_URL="${BASE_URL%:*}:8081"  # Assume cockpit on 8081
+# Extract host (remove port if present) and add :8081
+if [[ "$BASE_URL" =~ ^(https?://[^:]+)(:[0-9]+)?$ ]]; then
+    COCKPIT_URL="${BASH_REMATCH[1]}:8081"
+else
+    COCKPIT_URL="http://localhost:8081"
+fi
 SESSION_ID="smoke-$(date +%s)-$$"
 TIMEOUT_SECONDS=30
 SSE_FIFO="/tmp/wordflux-sse-$$.fifo"

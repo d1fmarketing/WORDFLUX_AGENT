@@ -38,6 +38,13 @@ from src.core.events import (
     get_default_emitter,
     format_sse_heartbeat
 )
+from src.core import board_store
+from src.core.board_store import (
+    EnglishColumnError,
+    InvalidColumnError as BoardInvalidColumnError,
+    canonicalize_list as canonicalize_pt_list,
+    get_board_snapshot,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -95,6 +102,18 @@ COLUMN_TITLES = {
     "Aprovação": "Aprovação",
     "Finalizado": "Finalizado"
 }
+
+# Complete 5-column EN→PT synonym mapping for dual-read support
+# Used by get_board_state() to consolidate cards from both EN and PT Redis keys
+COLUMN_SYNONYMS = board_store.COLUMN_SYNONYMS
+
+# Canonical Portuguese columns (5-column structure, aligned with chat tools)
+CANONICAL_PT_COLUMNS = board_store.CANONICAL_PT_COLUMNS
+
+
+def canonicalize_column(column: str) -> str:
+    """Canonicalize column name to canonical PT using shared board store."""
+    return canonicalize_pt_list(column, allow_english=False)
 
 
 def get_column_title(column_id: str) -> str:
@@ -206,60 +225,14 @@ def get_columns() -> List[str]:
 
 
 def get_board_state() -> Dict[str, Any]:
-    """Get complete board state including cards and autopilot mode.
-
-    Returns:
-        {
-            "columns": {
-                "Espera": [Card, ...],
-                "Produção": [Card, ...],
-                "Aprovação": [Card, ...],
-                "Agendado": [Card, ...],
-                "Finalizado": [Card, ...]
-            },
-            "autopilot": bool
-        }
-    """
-    r = rclient()
-    cols = get_columns()
-    columns_dict = {}
-
-    for c in cols:
-        key = f"wf:board:col:{c}"
-        items = r.lrange(key, 0, -1)  # newest first
-        cards = []
-
-        for raw in items:
-            try:
-                card = json.loads(raw)
-
-                # Validar card contra schema
-                try:
-                    from src.core.schemas import CardSchema
-                    validated_card = CardSchema(**card).model_dump()
-                    cards.append(validated_card)
-                except Exception as validation_error:
-                    logger.warning(f"⚠️ Card inválido removido da coluna '{c}': {validation_error}")
-                    # Remove card inválido do Redis
-                    r.lrem(key, 1, raw)
-
-            except json.JSONDecodeError as e:
-                logger.warning(f"⚠️ Card mal-formado removido da coluna '{c}': {e}")
-                r.lrem(key, 1, raw)
-
-        columns_dict[c] = cards
-
-    autopilot = r.get("wf:agent:autopilot") == "1"
-
-    # Validar resposta completa contra schema
+    """Get complete board state using shared board store."""
     try:
-        from src.core.schemas import BoardStateSchema
-        validated_state = BoardStateSchema(columns=columns_dict, autopilot=autopilot)
-        return validated_state.model_dump()
-    except Exception as e:
-        logger.error(f"❌ Erro ao validar estado do board: {e}")
-        # Retornar estado parcial mas válido em caso de erro
-        return {"columns": {col: [] for col in cols}, "autopilot": False}
+        snapshot = get_board_snapshot()
+        return snapshot
+    except Exception as exc:  # pragma: no cover - Redis errors
+        logger.error(f"❌ Erro ao obter estado do board: {exc}")
+        return {"columns": {col: [] for col in CANONICAL_PT_COLUMNS}, "autopilot": False}
+
 
 
 def emit_event(kind: str, payload: Dict[str, Any]) -> None:
@@ -276,20 +249,46 @@ def push_to(column: str, card: Dict[str, Any], bypass_wip: bool = False) -> bool
     """
     Push card to a specific column respecting WIP limits.
 
-    During migration: Writes to BOTH English and Portuguese keys.
-
     Args:
-        column: Target column name (English or Portuguese)
+        column: Target column name (English or Portuguese, canonicalized automatically)
         card: Card data
         bypass_wip: If True, skip WIP checks (for system operations)
 
     Returns:
         True if card was added, False if WIP limit prevented it
+
+    Raises:
+        ValueError: If column is invalid
     """
     r = rclient()
 
-    # Normalize column name to Portuguese
-    pt_column = COLUMN_NAME_MIGRATION.get(column, column)
+    # CANONICAL VALIDATION: Ensure column is valid and normalized to PT
+    try:
+        pt_column = canonicalize_column(column)
+    except EnglishColumnError as exc:
+        try:
+            from src.core.metrics import board_writer_rejected_total
+            board_writer_rejected_total.labels(reason='en_attempt').inc()
+        except ImportError:
+            pass
+
+        logger.error(
+            f"❌ push_to() rejected English column '{column}': {exc}",
+            extra={"operation": "push", "input_column": column, "reason": "en_attempt"}
+        )
+        raise
+    except BoardInvalidColumnError as exc:
+        try:
+            from src.core.metrics import board_writer_rejected_total
+            board_writer_rejected_total.labels(reason='invalid_column').inc()
+        except ImportError:
+            pass
+
+        logger.error(
+            f"❌ push_to() rejected invalid column '{column}': {exc}",
+            extra={"operation": "push", "input_column": column, "reason": "invalid_column"}
+        )
+        raise
 
     # Check WIP limit for "Produção" column (unless bypassed)
     if pt_column == "Produção" and not bypass_wip:
@@ -313,6 +312,12 @@ def push_to(column: str, card: Dict[str, Any], bypass_wip: bool = False) -> bool
                 current_count=current_count,
                 limit=wip_limit
             )
+            # Métrica de rejeição WIP
+            try:
+                from src.core.metrics import board_writer_rejected_total
+                board_writer_rejected_total.labels(reason='wip_limit').inc()
+            except ImportError:
+                pass
             return False
 
     card["status"] = pt_column
@@ -330,6 +335,24 @@ def push_to(column: str, card: Dict[str, Any], bypass_wip: bool = False) -> bool
         logger.debug(f"Dual-key write: {pt_key} + {en_key}")
 
     emit_board_update(cards=[card])
+
+    # Métrica de sucesso
+    try:
+        from src.core.metrics import board_writer_total
+        board_writer_total.labels(column=pt_column, operation='push').inc()
+    except ImportError:
+        pass  # Metrics not available (tests)
+
+    # Logging estruturado
+    logger.info(
+        f"✅ Card pushed to {pt_column}",
+        extra={
+            "operation": "push",
+            "column": pt_column,
+            "card_id": card.get("id"),
+            "card_title": card.get("title", "")[:40]  # Truncate for logs
+        }
+    )
 
     # Check if we should trigger a notification
     if pt_column in NOTIFY_TRIGGERS:
@@ -376,7 +399,10 @@ def find_and_remove(card_id: str) -> (Optional[Dict[str, Any]], Optional[str]):
             if card.get("id") == card_id:
                 r.lrem(key, 1, raw)
                 # Return Portuguese column name
-                pt_col = COLUMN_NAME_MIGRATION.get(en_col, en_col)
+                try:
+                    pt_col = canonicalize_pt_list(en_col, allow_english=True)
+                except BoardInvalidColumnError:
+                    pt_col = en_col
                 return card, pt_col
 
     return None, None
@@ -468,29 +494,29 @@ def agent_act(card_id: str, action: str) -> Dict[str, Any]:
                           idempotency_key=f"action-{card_id}-{action}-{int(time.time())}")
     except Exception as e:
         # Return card to original position on error (bypass WIP to ensure revert succeeds)
-        push_to(cur or "Backlog", card, bypass_wip=True)
+        push_to(cur or "Espera", card, bypass_wip=True)
         return {"error": str(e)}
 
     # Determine next column based on action
     nxt = cur  # default return if unknown
     if action == "start_work":
-        nxt = "In Progress"
+        nxt = "Produção"
     elif action == "send_for_review":
-        nxt = "Waiting Approval"
+        nxt = "Aprovação"
     elif action == "approve":
-        nxt = "Scheduled"
+        nxt = "Agendado"
     elif action == "request_changes":
-        nxt = "In Progress"
+        nxt = "Produção"
     elif action == "publish_now":
-        nxt = "Published"
+        nxt = "Finalizado"
     elif action == "report_kpis":
-        nxt = "Published"
+        nxt = "Finalizado"
         emit_event("kpi_report", {"card": card})
     elif action == "reschedule":
-        nxt = "Scheduled"
+        nxt = "Agendado"
     else:
         # unknown action, revert to original column if we had one
-        nxt = cur or "Backlog"
+        nxt = cur or "Espera"
 
     # Update card with job info
     card["last_job_id"] = job_id
@@ -499,12 +525,12 @@ def agent_act(card_id: str, action: str) -> Dict[str, Any]:
     # Try to push to next column; if WIP exceeded, revert to original
     if not push_to(nxt, card):
         logger.warning(f"WIP limit exceeded for {nxt}, reverting card {card_id} to {cur}")
-        push_to(cur or "Backlog", card, bypass_wip=True)
+        push_to(cur or "Espera", card, bypass_wip=True)
         return {
             "error": "wip_limit_exceeded",
             "message": f"Cannot move to {nxt}: WIP limit reached",
             "card_id": card_id,
-            "reverted_to": cur or "Backlog"
+            "reverted_to": cur or "Espera"
         }
 
     emit_event("agent_action", {
@@ -1137,6 +1163,27 @@ INDEX_HTML = """<!DOCTYPE html>
       justify-content: space-between;
       gap: var(--spacing-sm);
       margin-bottom: var(--spacing-sm);
+    }
+
+    .status-chip {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      white-space: nowrap;
+    }
+
+    .status-pending {
+      background: #64748b;
+      color: white;
+    }
+
+    .card-pending {
+      opacity: 0.8;
+      border-left: 3px solid #64748b;
     }
 
     .card-title {
@@ -1970,6 +2017,15 @@ INDEX_HTML = """<!DOCTYPE html>
         .substr(0, 2);
     }
 
+    function generateUUID() {
+      // Simple UUID v4 generator for temporary card IDs
+      return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+        const r = Math.random() * 16 | 0;
+        const v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+      });
+    }
+
     function announce(message) {
       const liveRegion = document.querySelector('.sr-only[role="status"]');
       if (liveRegion) {
@@ -2251,12 +2307,13 @@ INDEX_HTML = """<!DOCTYPE html>
             }
           });
 
-          // Renderizar cards por coluna
+          // Renderizar cards por coluna (com normalização)
           Object.entries(data.columns).forEach(([colName, cards]) => {
             const colId = this.normalizeColumnId(colName);
             if (colId && this.columns[colId]) {
               cards.forEach(card => {
-                this.addCard(colId, card);
+                const normalized = this.normalizeCard(card);
+                this.addCard(colId, normalized);
               });
             }
           });
@@ -2274,8 +2331,94 @@ INDEX_HTML = """<!DOCTYPE html>
         }
       },
 
+      normalizeCard(c) {
+        // Normalize card data from any source (/board/state or SSE) to consistent structure
+        // Returns: { id, title, list, tags, progress, attachments, comments, assignee, isPending }
+
+        // Handle pending/temporary IDs (optimistic updates)
+        let cardId = c.id || c.card_id || c.temp_id;
+        let isPending = false;
+
+        if (!cardId || cardId.startsWith('tmp:')) {
+          // Generate temporary ID for pending cards
+          cardId = `tmp:${generateUUID()}`;
+          isPending = true;
+        } else if (c.temp_id) {
+          // Explicit temporary ID from SSE card.pending event
+          cardId = c.temp_id;
+          isPending = true;
+        }
+
+        // Normalize tags (handle string, array of strings, or array of objects)
+        let tags = [];
+        if (c.tags) {
+          if (typeof c.tags === 'string') {
+            // "urgent,feature" → [{label: 'urgent', type: 'default'}, ...]
+            tags = c.tags.split(',').map(t => ({
+              label: t.trim(),
+              type: 'default'
+            }));
+          } else if (Array.isArray(c.tags)) {
+            tags = c.tags.map(t => {
+              if (typeof t === 'string') {
+                return { label: t, type: 'default' };
+              } else if (t && typeof t === 'object') {
+                return {
+                  label: t.label || t.name || 'tag',
+                  type: t.type || 'default'
+                };
+              }
+              return { label: 'unknown', type: 'default' };
+            });
+          }
+        }
+
+        // Extract metadata with defaults
+        const progress = Math.max(0, Math.min(100, Number(c.progress ?? 0)));
+        const attachments = Number.parseInt(c.attachments ?? c.attachment_count ?? 0, 10) || 0;
+        const comments = Number.parseInt(c.comments ?? c.comment_count ?? 0, 10) || 0;
+
+        // Normalize assignee
+        let assignee = null;
+        if (c.assignee) {
+          if (typeof c.assignee === 'string') {
+            assignee = { name: c.assignee, avatar: null };
+          } else if (typeof c.assignee === 'object') {
+            assignee = {
+              name: c.assignee.name || c.assignee.username || 'Unknown',
+              avatar: c.assignee.avatar || c.assignee.avatar_url || null
+            };
+          }
+        } else if (c.assigned_to) {
+          assignee = { name: c.assigned_to, avatar: null };
+        }
+
+        const columnSynonyms = {
+          'Backlog': 'Espera',
+          'In Progress': 'Produção',
+          'Waiting Approval': 'Aprovação',
+          'Scheduled': 'Agendado',
+          'Published': 'Finalizado'
+        };
+
+        let listName = c.list || c.list_name || c.column || 'Espera';
+        listName = columnSynonyms[listName] || listName;
+
+        return {
+          id: cardId,
+          title: c.title || c.card_title || 'Sem título',
+          list: listName,
+          tags: tags,
+          progress: progress,
+          attachments: attachments,
+          comments: comments,
+          assignee: assignee,
+          isPending: isPending
+        };
+      },
+
       createCard(cardData) {
-        const { id, title, tags = [], progress, attachments = 0, comments = 0, assignee } = cardData;
+        const { id, title, tags = [], progress, attachments = 0, comments = 0, assignee, isPending = false } = cardData;
 
         const card = document.createElement('article');
         card.className = 'board-card';
@@ -2284,9 +2427,15 @@ INDEX_HTML = """<!DOCTYPE html>
         card.setAttribute('role', 'article');
         card.setAttribute('aria-label', `Card: ${title}`);
 
+        // Add pending class if card is optimistic update
+        if (isPending) {
+          card.classList.add('card-pending');
+        }
+
         let html = `
           <div class="card-header">
             <h3 class="card-title">${escapeHTML(title)}</h3>
+            ${isPending ? '<span class="status-chip status-pending">PENDENTE</span>' : ''}
             <button class="card-menu" aria-label="Ações do card">⋮</button>
           </div>
         `;
@@ -2467,25 +2616,92 @@ INDEX_HTML = """<!DOCTYPE html>
 
       handleCardCreated(event) {
         // event: { kind, id, title, list, meta?, ts }
-        const card = {
+
+        // RECONCILIATION: Remove pending card before adding real one
+        // Pending cards have temp_id = job_id (format: "job-xxxxx")
+        const colId = this.normalizeColumnId(event.list);
+        if (colId && this.columns[colId]) {
+          // Find pending card by title in target column
+          const cards = this.columns[colId].querySelectorAll('[data-card-id]');
+          cards.forEach(card => {
+            const cardId = card.dataset.cardId;
+            const cardTitle = card.querySelector('.card-title')?.textContent;
+
+            // Remove if pending (starts with "job-") and same title
+            if (cardId && cardId.startsWith('job-') && cardTitle === event.title) {
+              console.log(`[Reconcile] Removing pending card ${cardId} → real ${event.id}`);
+              this.removeCard(cardId);
+            }
+          });
+        }
+
+        // Add real card
+        const normalized = this.normalizeCard({
           id: event.id,
           title: event.title,
-          meta: event.meta || {}
-        };
-        const colId = this.normalizeColumnId(event.list);
+          list: event.list,
+          ...(event.meta || {})  // Spread meta fields (tags, progress, assignee, etc)
+        });
         if (colId) {
-          this.addCard(colId, card);
+          this.addCard(colId, normalized);
           announce(`Card criado: ${event.title}`);
+          NotificationManager.show(
+            'success',
+            '✅',
+            `Card "${event.title}" criado em ${event.list}`
+          );
+        }
+      },
+
+      handleCardPending(event) {
+        // event: { kind, temp_id, title, list_name, meta?, ts }
+        // Handle optimistic updates (pending cards before worker processes them)
+        const normalized = this.normalizeCard({
+          temp_id: event.temp_id,
+          title: event.title,
+          list: event.list_name,
+          ...(event.meta || {})
+        });
+        const colId = this.normalizeColumnId(event.list_name);
+        if (colId) {
+          this.addCard(colId, normalized);
+          announce(`Card pendente: ${event.title}`);
         }
       },
 
       handleCardMoved(event) {
         // event: { kind, id, title, from_list, to_list, meta?, ts }
+
+        // RECONCILIATION: Remove pending card (move_card jobs create pending too)
         const from = this.normalizeColumnId(event.from_list);
         const to = this.normalizeColumnId(event.to_list);
+
+        // Check both from and to columns for pending cards
+        [from, to].forEach(colId => {
+          if (colId && this.columns[colId]) {
+            const cards = this.columns[colId].querySelectorAll('[data-card-id]');
+            cards.forEach(card => {
+              const cardId = card.dataset.cardId;
+              const cardTitle = card.querySelector('.card-title')?.textContent;
+
+              // Remove if pending (job-*) and same title
+              if (cardId && cardId.startsWith('job-') && cardTitle === event.title) {
+                console.log(`[Reconcile] Removing pending move card ${cardId} → real ${event.id}`);
+                this.removeCard(cardId);
+              }
+            });
+          }
+        });
+
+        // Move real card
         if (from && to) {
           this.moveCard(event.id, from, to);
           announce(`Card movido para ${event.to_list}`);
+          NotificationManager.show(
+            'success',
+            '✅',
+            `Card "${event.title}" movido para ${event.to_list}`
+          );
         }
       },
 
@@ -2580,6 +2796,7 @@ INDEX_HTML = """<!DOCTYPE html>
       const schemas = {
         'chat_message': (e) => e.role && e.text,
         'card.created': (e) => e.id && e.title && e.list,
+        'card.pending': (e) => e.temp_id && e.title && e.list_name,
         'card.moved': (e) => e.id && e.title && e.from_list && e.to_list,
         'card.updated': (e) => e.id && e.title && e.list && Array.isArray(e.fields_updated),
         'pending.confirmation': (e) => e.token && e.summary,
@@ -2659,6 +2876,7 @@ INDEX_HTML = """<!DOCTYPE html>
           'chat_message': (e) => ChatManager.handleSSEMessage(e),
           'board_update': (e) => BoardManager.handleBoardUpdate(e),  // Legacy
           'card.created': (e) => BoardManager.handleCardCreated(e),
+          'card.pending': (e) => BoardManager.handleCardPending(e),  // Optimistic updates
           'card.moved': (e) => BoardManager.handleCardMoved(e),
           'card.updated': (e) => BoardManager.handleCardUpdated(e),
           'pending.confirmation': (e) => ChatManager.handlePendingConfirmation(e),
@@ -2709,17 +2927,37 @@ INDEX_HTML = """<!DOCTYPE html>
       }
 
       handleJobEvent(event, type) {
-        const titles = {
-          'started': 'Job Iniciado',
-          'success': 'Job Concluído',
-          'error': 'Job Falhou'
-        };
+        if (type === 'error') {
+          // FAILURE HANDLING: Remove pending card and show PT-BR error
+          const jobId = event.job_id;
 
-        NotificationManager.show(
-          type === 'started' ? 'info' : type,
-          titles[type],
-          event.job_id || 'Job processado'
-        );
+          // Remove pending card with this job_id (from any column)
+          Object.values(BoardManager.columns).forEach(column => {
+            if (column) {
+              const pendingCard = column.querySelector(`[data-card-id="${jobId}"]`);
+              if (pendingCard) {
+                console.log(`[JobFailed] Removing pending card ${jobId}`);
+                BoardManager.removeCard(jobId);
+              }
+            }
+          });
+
+          // Show PT-BR toast with error hint
+          const errorMsg = event.hint || event.error || 'Operação falhou';
+          NotificationManager.show('error', '❌ Falhou', `Falhou: ${errorMsg}`);
+        } else {
+          // Success/started (existing logic)
+          const titles = {
+            'started': 'Job Iniciado',
+            'success': 'Job Concluído'
+          };
+
+          NotificationManager.show(
+            type === 'started' ? 'info' : type,
+            titles[type],
+            event.job_id || 'Job processado'
+          );
+        }
       }
 
       handleWIPLimit(event) {
@@ -3007,17 +3245,27 @@ def build_app() -> FastAPI:
 
     @app.post("/board/card")
     def board_add(body: Dict[str, Any] = Body(...)):
-        """Create a new card in Backlog."""
+        """Create a new card (defaults to Espera column)."""
+        # Validate and canonicalize column (defaults to Espera)
+        column_input = body.get("column", "Espera")
+        try:
+            column = canonicalize_column(column_input)
+        except ValueError as e:
+            return JSONResponse(
+                {"error": "invalid_column", "message": str(e)},
+                status_code=400
+            )
+
         title = (body.get("title") or body.get("intent") or "Untitled").strip()[:140]
         card = {
             "id": "c-" + uuid.uuid4().hex[:8],
             "title": title,
             "intent": body.get("intent") or "",
-            "status": "Backlog",
+            "status": column,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "meta": body.get("meta") or {},
         }
-        push_to("Backlog", card)
+        push_to(column, card)
         return {"created": card}
 
     @app.post("/board/move")
@@ -3025,14 +3273,24 @@ def build_app() -> FastAPI:
         """Move a card to a different column."""
         card_id = body["card_id"]
         to = body["to"]
+
+        # Validate and canonicalize destination column
+        try:
+            to_canonical = canonicalize_column(to)
+        except ValueError as e:
+            return JSONResponse(
+                {"error": "invalid_column", "message": str(e)},
+                status_code=400
+            )
+
         card, cur = find_and_remove(card_id)
         if not card:
             return JSONResponse({"error": "not_found"}, status_code=404)
 
         # Try to push to target column; if WIP exceeded, revert
-        if not push_to(to, card):
+        if not push_to(to_canonical, card):
             # Revert to original column (bypass WIP)
-            push_to(cur or "Backlog", card, bypass_wip=True)
+            push_to(cur or "Espera", card, bypass_wip=True)
             return JSONResponse({
                 "error": "wip_limit_exceeded",
                 "message": f"Cannot move to {to}: WIP limit reached",
@@ -3065,8 +3323,8 @@ def build_app() -> FastAPI:
         if not card:
             return JSONResponse({"error": "not_found"}, status_code=404)
         # return card to original column (read-only peek, bypass WIP to ensure it goes back)
-        push_to(cur or "Backlog", card, bypass_wip=True)
-        return {"card_id": card_id, "column": cur, "actions": suggest_actions(cur or "Backlog")}
+        push_to(cur or "Espera", card, bypass_wip=True)
+        return {"card_id": card_id, "column": cur, "actions": suggest_actions(cur or "Espera")}
 
     @app.post("/agent/act")
     def agent_act_api(body: Dict[str, Any] = Body(...)):

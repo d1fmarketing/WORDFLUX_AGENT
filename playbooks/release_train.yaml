@@ -1,0 +1,54 @@
+name: Release Train
+description: Complete release workflow with notifications
+version: "1.0"
+
+# Input parameters expected
+inputs:
+  linear_issue: ""  # Linear issue ID to update
+  slack_channel: "#releases"
+  days_to_export: 30
+
+steps:
+  - name: Export Stripe disputes
+    agent: stripe_disputes
+    with:
+      days: "{{ input.days_to_export }}"
+      format: csv
+    retry:
+      max_attempts: 3
+      backoff: exponential
+      delay_seconds: 2
+
+  - name: Notify Slack about export
+    agent: slack_notifier
+    with:
+      channel: "{{ input.slack_channel }}"
+      message: "✅ Stripe dispute export completed"
+      csv_url: "{{ steps[0].result.artifact_url }}"
+      export_type: "Stripe Disputes"
+      record_count: "{{ steps[0].result.record_count }}"
+      file_size: "{{ steps[0].result.file_size }}"
+      duration_seconds: "{{ steps[0].duration }}"
+      job_id: "{{ steps[0].result.job_id }}"
+    continue_on_error: true  # Don't fail if Slack is down
+
+  - name: Update Linear card
+    agent: linear_connector
+    with:
+      issue_id: "{{ input.linear_issue }}"
+      status: success
+      message: "Stripe export completed successfully"
+      artifact_url: "{{ steps[0].result.artifact_url }}"
+      metrics:
+        duration_seconds: "{{ steps[0].duration }}"
+        record_count: "{{ steps[0].result.record_count }}"
+        file_size: "{{ steps[0].result.file_size }}"
+    condition: "input.linear_issue != ''"  # Only run if Linear issue provided
+    continue_on_error: true
+
+on_failure: notify_slack_error
+
+tags:
+  - release
+  - stripe
+  - automated

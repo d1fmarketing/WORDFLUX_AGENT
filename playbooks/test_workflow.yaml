@@ -1,0 +1,39 @@
+name: Test Workflow
+description: Simple test workflow with echo agents
+version: "1.0"
+
+inputs:
+  message: "Hello from playbook"
+  iterations: 3
+
+steps:
+  - name: First echo
+    agent: echo
+    with:
+      message: "Starting workflow with: {{ input.message }}"
+
+  - name: Second echo with lock
+    agent: echo
+    with:
+      message: "Processing step 2"
+      previous_result: "{{ steps[0].result.message }}"
+    lock:
+      resource: "test:echo"
+      timeout: 30
+      wait: true
+    retry:
+      max_attempts: 2
+      backoff: linear
+      delay_seconds: 1
+
+  - name: Final echo
+    agent: echo
+    with:
+      message: "Workflow complete!"
+      total_steps: "{{ steps | length }}"
+      first_message: "{{ steps[0].result.message }}"
+    continue_on_error: false
+
+tags:
+  - test
+  - demo

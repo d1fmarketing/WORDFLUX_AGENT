@@ -8,11 +8,13 @@ from src.api.main import app
 
 
 def test_metrics_endpoint_not_exposed():
-    """Test that metrics endpoint is not exposed by default in API."""
+    """Test that metrics endpoint is exposed and returns Prometheus format."""
     client = TestClient(app)
     response = client.get("/metrics")
-    # Currently metrics are collected but not exposed via API endpoint
-    assert response.status_code == 404
+    # Metrics endpoint is now exposed (returns Prometheus-format metrics)
+    assert response.status_code == 200
+    # Check for Prometheus-format metrics
+    assert "wordflux_" in response.text or "# HELP" in response.text
 
 
 def test_metrics_module_imports():

@@ -71,37 +71,108 @@ class SlackNotifierAgent(BaseAgent):
             if channel:
                 slack_data["channel"] = channel
 
-            # Add attachment for CSV export details
+            # Add structured attachment for CSV export or other notifications
             csv_url = payload.get("csv_url")
+            export_type = payload.get("export_type", "Export")
+
+            # Build rich attachment
+            attachments = []
+
             if csv_url:
-                export_type = payload.get("export_type", "CSV Export")
+                # CSV export notification
                 record_count = payload.get("record_count")
+                file_size = payload.get("file_size")
+                duration = payload.get("duration_seconds")
+                job_id = payload.get("job_id")
 
                 attachment = {
                     "color": "good",
-                    "title": f"{export_type} Ready",
+                    "title": f"✅ {export_type} Complete",
+                    "title_link": csv_url,
                     "fields": []
                 }
 
+                # Add metrics fields
                 if record_count is not None:
                     attachment["fields"].append({
-                        "title": "Records",
-                        "value": str(record_count),
+                        "title": "📊 Records",
+                        "value": f"{record_count:,}",
                         "short": True
                     })
 
+                if file_size:
+                    # Convert bytes to human-readable
+                    size_mb = file_size / (1024 * 1024)
+                    attachment["fields"].append({
+                        "title": "💾 Size",
+                        "value": f"{size_mb:.2f} MB",
+                        "short": True
+                    })
+
+                if duration:
+                    attachment["fields"].append({
+                        "title": "⏱️ Duration",
+                        "value": f"{duration:.1f}s",
+                        "short": True
+                    })
+
+                if job_id:
+                    attachment["fields"].append({
+                        "title": "🔖 Job ID",
+                        "value": f"`{job_id}`",
+                        "short": True
+                    })
+
+                # Add download button
                 attachment["fields"].append({
-                    "title": "Download URL",
+                    "title": "📥 Download",
                     "value": f"<{csv_url}|Download CSV>",
                     "short": False
                 })
 
-                # Add timestamp
-                import datetime
-                attachment["ts"] = int(datetime.datetime.utcnow().timestamp())
-                attachment["footer"] = "WordFlux Export"
+                # Add timestamp and footer
+                from datetime import datetime, timezone
+                attachment["ts"] = int(datetime.now(timezone.utc).timestamp())
+                attachment["footer"] = "WordFlux Agent System"
+                attachment["footer_icon"] = "https://platform.slack-edge.com/img/default_application_icon.png"
 
-                slack_data["attachments"] = [attachment]
+                attachments.append(attachment)
+
+            elif payload.get("error"):
+                # Error notification
+                error = payload.get("error")
+                job_id = payload.get("job_id")
+                agent_name = payload.get("agent")
+
+                attachment = {
+                    "color": "danger",
+                    "title": f"❌ {export_type} Failed",
+                    "text": f"```{error}```",
+                    "fields": []
+                }
+
+                if job_id:
+                    attachment["fields"].append({
+                        "title": "Job ID",
+                        "value": f"`{job_id}`",
+                        "short": True
+                    })
+
+                if agent_name:
+                    attachment["fields"].append({
+                        "title": "Agent",
+                        "value": agent_name,
+                        "short": True
+                    })
+
+                from datetime import datetime, timezone
+                attachment["ts"] = int(datetime.now(timezone.utc).timestamp())
+                attachment["footer"] = "WordFlux Agent System"
+
+                attachments.append(attachment)
+
+            if attachments:
+                slack_data["attachments"] = attachments
 
             # Send to Slack
             response = requests.post(

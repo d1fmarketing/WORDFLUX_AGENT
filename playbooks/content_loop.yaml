@@ -1,0 +1,78 @@
+name: Content Loop
+description: Autonomous content creation and progression workflow
+version: "1.0"
+
+# Input parameters
+inputs:
+  template: "default"  # Content template to use
+  target_count: 3  # Number of content pieces to generate
+  auto_start: false  # Automatically start first card
+
+steps:
+  - name: Generate content ideas
+    agent: echo
+    with:
+      message: "💡 Generating {{ input.target_count }} content ideas using template '{{ input.template }}'"
+      template: "{{ input.template }}"
+      count: "{{ input.target_count }}"
+
+  - name: Log content generation metrics
+    agent: metrics_reporter
+    with:
+      event: "content_ideas_generated"
+      metrics:
+        template: "{{ input.template }}"
+        count: "{{ input.target_count }}"
+        timestamp: "{{ steps[0].result.timestamp }}"
+    continue_on_error: true
+
+  - name: Create sample content card
+    agent: board_operator
+    with:
+      action: "create_card"
+      title: "Content Idea: {{ input.template }} #1"
+      description: "Auto-generated content card from Content Loop playbook"
+      column: "Espera"
+      meta:
+        source: "content-loop-playbook"
+        template: "{{ input.template }}"
+        batch_id: "{{ steps[0].result.timestamp }}"
+
+  - name: Auto-start content card
+    agent: task_starter
+    with:
+      card_id: "{{ steps[2].result.card.id }}"
+      reason: "Auto-started by Content Loop playbook"
+    condition: "input.auto_start == true and steps[2].success"
+    continue_on_error: true
+
+  - name: Report final metrics
+    agent: metrics_reporter
+    with:
+      event: "content_loop_completed"
+      metrics:
+        ideas_generated: "{{ input.target_count }}"
+        cards_created: 1
+        auto_started: "{{ steps[3].success }}"
+        template: "{{ input.template }}"
+        total_duration: "{{ steps | map(attribute='duration') | sum }}"
+    continue_on_error: true
+
+  - name: Notify Slack
+    agent: slack_notifier
+    with:
+      channel: "#content"
+      message: |
+        📝 **Content Loop Completed**
+
+        - Template: {{ input.template }}
+        - Cards Created: 1
+        - Auto-Started: {{ steps[3].success }}
+      export_type: "Content Loop"
+    continue_on_error: true
+
+tags:
+  - content
+  - automation
+  - planner
+  - workflow
